@@ -14,10 +14,11 @@ npm test             # physics self-check: tunneling, angle reflection, walls, s
 npm run smoke        # end-to-end against a running server (pass a base URL to target another host)
 ```
 
-`PONG_RESERVE_MS` shortens the 30 s disconnect reservation; set it on both the
-server and the smoke run (CI uses `1000`) so the claim-after-lapse path can be
-tested without waiting half a minute. The smoke test skips that one assertion
-when the window is longer than 3 s.
+`npm run smoke` needs no environment setup and no waiting: it asks `POST /room`
+for its own short reconnect and sweep windows, so every assertion — including
+the spectator claim after a lapsed reservation, and the room sweep — runs
+against any server, production included. `PONG_RESERVE_MS` and
+`PONG_EMPTY_TTL_MS` only change the *defaults* for rooms that don't ask.
 
 Open <http://localhost:8080>, click **Create room**, and share the `/r/<id>` URL.
 Everyone uses the same link: the first two openers can choose **Play**, everyone
@@ -34,14 +35,19 @@ Controls (players only): mouse, touch, arrow keys, or W/S.
 - A player disconnecting pauses the game and reserves their slot for 30 s. They
   can reconnect with the token in `sessionStorage`. After 30 s the slot opens and
   any spectator can claim it — first claim wins, play resumes.
-- Rooms are in-memory, swept every 5 s: dropped when empty, or after 10 minutes
-  with no player in either slot.
+- Rooms are in-memory, swept every 5 s: dropped when they have no connections at
+  all, or after 10 minutes with no player in either slot. A room with spectators
+  but no player survives until that second timeout.
+- Both windows are per room: `POST /room` may shorten them (see below), which is
+  how the smoke test covers the claim and sweep paths in seconds instead of
+  minutes. This is deliberately unauthenticated — the worst anyone can do is make
+  their *own* room forget them faster.
 
 ## HTTP
 
 | Method | Path | Response |
 | --- | --- | --- |
-| `POST` | `/room` | `{"id":"<8 url-safe chars>"}`, room created |
+| `POST` | `/room` | `{id, reserveMs, emptyMs}`, room created. Optional JSON body `{reserveMs, emptyMs}` overrides that room's disconnect reservation (500 ms – 60 s) and no-player TTL (1 s – 10 min); out-of-range and junk values fall back to the defaults, and the body is capped at 1 KB. The response echoes the values actually used |
 | `GET` | `/health` | `{ok, version, rooms, uptime}` — `version` is `RENDER_GIT_COMMIT` or `dev`. CI polls it to confirm the new process is serving traffic before smoke-testing it |
 | `GET` | `/` | landing page (create / join by id) |
 | `GET` | `/r/:id` | the same `client.html` |
@@ -88,10 +94,31 @@ button. `t` is the server's send time.
 
 Snapshots go into a 12-deep buffer and are rendered 100 ms in the past,
 interpolated between the two bracketing snapshots — raw snapshot positions are
-never drawn. A player predicts its own paddle locally from its own input and
-eases toward the authoritative y in each snapshot (snapping if the error exceeds
-40 units); the opponent's paddle and the ball are interpolation only. Spectators
-predict nothing. The 800×450 space is letterboxed onto the canvas at draw time.
+never drawn. The opponent's paddle and the ball are interpolation only, and
+spectators predict nothing. The 800×450 space is letterboxed onto the canvas at
+draw time.
+
+A player's own paddle is predicted locally and never corrected mid-motion. A
+snapshot describes the paddle as it was a round trip ago, so while the player is
+gliding it, being ahead of the server by speed × latency is correct prediction,
+not error — nudging the rendered paddle toward that stale sample is what makes a
+glide stutter, badly enough to snap backwards ~70 units per snapshot at 100 ms.
+Position cannot be corrected here either: the paddle's position is a pure
+function of a target this client owns, so the next frame's prediction pulls any
+nudge straight back. So reconciliation instead waits until the paddle is settled
+(target reached and unchanged for 150 ms) and, if the server is still working
+from a different target — an input lost with a dying socket — re-sends the
+target, at most twice a second, and lets the server's own simulation close the
+gap.
+
+An unexpected drop — the common case on mobile — reconnects automatically:
+roughly 250 ms, 500 ms, 1 s, 2 s, 4 s, then capped at 5 s, each jittered ±20%,
+for about 30 s, showing "reconnecting…" with the attempt count. A player reuses
+the `sessionStorage` token and lands back in their own slot; a spectator just
+rejoins. After 30 s it stops and offers a manual button. Deliberate closes never
+enter that loop: `4001` falls straight back to watching, `4002` and `4003` show
+the reason with a manual button, and `4004` says the server is restarting and
+enables its button after 8 s, since the replacement instance needs time to boot.
 
 ## Deployment
 
@@ -124,8 +151,8 @@ route a joiner to the right one. Never add autoscaling or raise `numInstances`.
 
 `test` runs on every push to `main` and every pull request: `npm ci`,
 `node --check server.js`, `npm test`, then it starts the server on 8080, waits
-for `/health`, and runs `scripts/smoke.mjs` against it with a 1 s reservation
-window so every assertion runs.
+for `/health`, and runs `scripts/smoke.mjs` against it — with no env overrides,
+so it exercises exactly the path the live smoke does.
 
 `deploy` runs only on a push to `main` that passed `test`:
 
@@ -137,8 +164,15 @@ window so every assertion runs.
    `update_failed`, `pre_deploy_failed` or `canceled` (10 minute cap).
 4. Poll `{APP_URL}/health` until `version` equals the pushed SHA. This is what
    proves the *new* process is serving traffic; without it the next step would
-   smoke-test the old process and pass while proving nothing.
-5. Run `scripts/smoke.mjs` against `APP_URL`.
+   smoke-test the old process and pass while proving nothing. On timeout the step
+   reports which of three things it last saw, because they roll back for very
+   different reasons: no response at all (service down or asleep),
+   `version: "dev"` (`RENDER_GIT_COMMIT` is not populated, so the gate can never
+   pass and the code is probably fine), or a different valid SHA (the old process
+   is still serving — the rollout is slower than the poll window).
+5. Run `scripts/smoke.mjs` against `APP_URL`. If it fails, the step prints
+   `/health` next to the smoke output, so a failed assertion can be attributed to
+   a stale process rather than to broken game logic.
 6. If any of the above fails, roll back to the recorded deploy id. Rollback
    reuses the old build artifact rather than rebuilding, so recovery does not
    reintroduce build-time risk mid-incident. With no recorded id, the job says

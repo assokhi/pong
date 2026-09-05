@@ -18,8 +18,8 @@ jobs:
       - run: node --check server.js
       - run: npm test
       - name: Smoke test against a local server
-        env:
-          PONG_RESERVE_MS: "1000" # short reservation so the claim-after-lapse path is covered
+        # no env overrides: the smoke test asks POST /room for its own short timings, so this
+        # runs exactly the same path as the live deployment
         run: |
           set -euo pipefail
           node server.js & echo $! > server.pid
@@ -92,19 +92,53 @@ jobs:
 
       - name: Wait for /health to report this commit
         run: |
-          set -euo pipefail
-          # generous first timeout: a free-tier instance with no traffic takes ~60s to wake
-          for i in $(seq 1 30); do
-            version=$(curl -sS --max-time 90 "$APP_URL/health" | jq -r '.version // ""' || echo "")
-            echo "live version: ${version:-unreachable}"
-            if [ "$version" = "$GITHUB_SHA" ]; then exit 0; fi
+          set -uo pipefail
+          # A failure here rolls the deploy back, so record enough to tell an infrastructure
+          # problem from a code problem: "unreachable" and "wrong version" are not the same fault.
+          state=unreachable
+          seen=""
+          for i in $(seq 1 20); do
+            # the first request pays the ~60s wake-up of a free instance with no traffic
+            if [ "$i" = 1 ]; then t=90; else t=20; fi
+            if body=$(curl -sS --max-time "$t" "$APP_URL/health"); then
+              seen=$(printf '%s' "$body" | jq -r '.version // "<no version field>"')
+              state=served
+              echo "live version: $seen"
+              if [ "$seen" = "$GITHUB_SHA" ]; then exit 0; fi
+            else
+              state=unreachable
+              seen=""
+              echo "/health did not respond"
+            fi
             sleep 5
           done
-          echo "/health never reported $GITHUB_SHA — the old process may still be serving traffic"
+          echo "::error::/health never reported $GITHUB_SHA"
+          if [ "$state" = unreachable ]; then
+            echo "Last observed: no response from $APP_URL/health."
+            echo "The service is down or asleep. This is an infrastructure fault, not the pushed code."
+          elif [ "$seen" = dev ]; then
+            echo "Last observed: version=\"dev\"."
+            echo "RENDER_GIT_COMMIT is not populated in the service environment, so this gate can never"
+            echo "pass no matter how long it polls. The deployed code is probably fine — fix the service"
+            echo "environment (or the health handler), not the app."
+          else
+            echo "Last observed: version=\"$seen\", expected \"$GITHUB_SHA\"."
+            echo "A different valid build is still serving traffic: the rollout is slower than this poll"
+            echo "window. Re-running the job may simply succeed."
+          fi
           exit 1
 
       - name: Smoke test the live deployment
-        run: node scripts/smoke.mjs "$APP_URL"
+        run: |
+          set -uo pipefail
+          if node scripts/smoke.mjs "$APP_URL"; then exit 0; fi
+          echo "::error::live smoke failed"
+          echo "--- $APP_URL/health right after the failure:"
+          curl -sS --max-time 30 "$APP_URL/health" || echo "(unreachable)"
+          echo
+          echo "If the version above is not $GITHUB_SHA, an older process is serving traffic and this is"
+          echo "a rollout fault, not game logic. If it matches, the assertion above is a real failure."
+          exit 1
 
       - name: Roll back on failure
         if: failure()

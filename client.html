@@ -27,6 +27,7 @@ const V = { W: 800, H: 450, R: 7, PW: 12, PH: 80, AX: 24, BX: 764, SPEED: 700, W
 const BUFFER = 100; // ms of interpolation delay
 
 let ws = null, role = null, chosen = false, buf = [], myY = V.H / 2, tgt = V.H / 2, sentY = null, sentAt = 0;
+let lastTgt = null, tgtAt = 0; // when the player last asked the paddle to go somewhere new
 let scale = 1, ox = 0, oy = 0, dpr = 1, uiKey = null;
 let sA = null, sB = null, su = 0; // interpolation pair, kept out of the render loop to avoid allocation
 let sScore = '0  0', sSpec = 'spectators 0', roleLabel = 'watching', lastScore = -1, lastSpec = -1;
@@ -44,41 +45,85 @@ if (!roomId) {
   };
   jn.onclick = () => { if (jid.value.trim()) location.href = '/r/' + jid.value.trim(); };
 } else {
-  const tok = sessionStorage.getItem('tok:' + roomId);
-  chosen = !!tok;
-  connect(tok ? 'play' : 'watch', tok);
+  chosen = !!sessionStorage.getItem('tok:' + roomId);
+  reconnect();
 }
 
 /* ---------- net ---------- */
+// The server says why it closed these; retrying would only repeat the same answer.
+const DELIBERATE = [4001, 4002, 4003, 4004];
+let attempt = 0, retryUntil = 0;
+
+// Resume as whoever we were: the token puts a player back in their own slot, and a
+// spectator (no token) just rejoins the room.
+function reconnect() {
+  const tok = sessionStorage.getItem('tok:' + roomId);
+  connect(tok ? 'play' : 'watch', tok);
+}
+
+function box(msg, btn) { // btn: 'now' | 'soon' | undefined
+  uiKey = 'gone';
+  uiEl.innerHTML = '<div class=box>' + msg +
+    (btn ? '<br><button id=rc' + (btn === 'soon' ? ' disabled' : '') + '>Reconnect</button>' : '') + '</div>';
+  const b = uiEl.querySelector('#rc');
+  if (!b) return;
+  b.onclick = () => location.reload();
+  if (btn === 'soon') setTimeout(() => { b.disabled = false; }, 8000); // a new instance needs a moment
+}
+
 function connect(r, token) {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}/ws?room=${encodeURIComponent(roomId)}&role=${r}` +
     (token ? '&token=' + encodeURIComponent(token) : ''));
   ws.onmessage = e => {
     const m = JSON.parse(e.data);
-    if (m.type === 'welcome') { Object.assign(V, m.dims); setRole(m.role, m.token); resize(); }
+    if (m.type === 'welcome') {
+      Object.assign(V, m.dims); setRole(m.role, m.token); resize();
+      attempt = 0; retryUntil = 0;
+      if (uiKey === 'gone') { uiKey = null; uiEl.innerHTML = ''; } // clear "reconnecting…"
+    }
     else if (m.type === 'role') { setRole(m.role, m.token); note('you are now player ' + m.role.toUpperCase()); }
     else if (m.type === 'state') {
       buf.push({ t: performance.now(), s: m });
       if (buf.length > 12) buf.shift();
-      if (role) { // reconcile local prediction against the authoritative paddle
-        const err = m.paddles[role] - myY;
-        myY += Math.abs(err) > 40 ? err : err * 0.2;
-      }
+      if (role) reconcile(m.paddles[role]);
       ui(m);
     }
   };
   ws.onclose = e => {
-    if (e.code === 4001 || e.code === 4002) {
+    role = null; roleLabel = 'watching';
+    if (e.code === 4001) { // someone else holds the paddle now: fall back to watching
       sessionStorage.removeItem('tok:' + roomId);
-      note(e.reason + (e.code === 4001 ? ' — watching instead' : ''));
-      if (e.code === 4001) { chosen = true; role = null; uiKey = null; return connect('watch'); }
+      note(e.reason + ' — watching instead');
+      chosen = true; uiKey = null;
+      return connect('watch');
     }
-    role = null; uiKey = 'gone';
-    const why = e.code === 4004 ? 'server restarting — reconnect in a moment'
-      : 'disconnected' + (e.reason ? ' — ' + e.reason : '');
-    uiEl.innerHTML = '<div class=box>' + why + '<br><button onclick="location.reload()">Reconnect</button></div>';
+    if (e.code === 4004) return box('server restarting — reconnect in a moment', 'soon');
+    if (DELIBERATE.includes(e.code)) return box('disconnected' + (e.reason ? ' — ' + e.reason : ''), 'now');
+    // Unexpected drop (mobile handover, wifi blip): retry with backoff for ~30 s.
+    if (!retryUntil) retryUntil = Date.now() + 30e3;
+    if (Date.now() >= retryUntil) return box('could not reconnect', 'now');
+    const wait = Math.round(Math.min(250 * 2 ** attempt, 5000) * (0.8 + Math.random() * 0.4));
+    attempt++;
+    box('reconnecting… (attempt ' + attempt + ')');
+    setTimeout(reconnect, wait);
   };
+}
+
+// A snapshot describes the paddle as it was a round trip ago, so while the player is still moving
+// it, being ahead of the server by speed x latency is correct prediction, not error. Nudging the
+// rendered paddle toward that stale sample is what made a glide stutter.
+//
+// Nor can the position be corrected here: the paddle's position is a pure function of a target
+// this client owns, so the next frame's prediction would pull any nudge straight back. A real
+// disagreement means the server is working from an older target — an input lost with a dying
+// socket, say — so the fix is to re-state intent and let the server's own simulation close the gap.
+let resentAt = 0;
+function reconcile(serverY) {
+  const now = performance.now();
+  if (Math.abs(tgt - myY) > 0.5 || now - tgtAt < 150) return;  // still gliding: not settled yet
+  if (Math.abs(serverY - tgt) < 2 || now - resentAt < 500) return;
+  sentY = null; resentAt = now; // frame() re-sends tgt; harmless if the server was merely catching up
 }
 
 function setRole(r, token) {
@@ -155,6 +200,7 @@ function frame(now) {
   if (role) { // local prediction of my own paddle
     const k = (keys.ArrowUp || keys.w || keys.W ? -1 : 0) + (keys.ArrowDown || keys.s || keys.S ? 1 : 0);
     if (k) tgt = clamp(tgt + k * V.SPEED * dt, V.PH / 2, V.H - V.PH / 2);
+    if (tgt !== lastTgt) { lastTgt = tgt; tgtAt = now; } // mouse, touch and keys all land here
     myY += clamp(tgt - myY, -V.SPEED * dt, V.SPEED * dt);
     if (tgt !== sentY && now - sentAt >= 16 && ws.readyState === 1) { // capped at ~60 msg/s
       ws.send('{"type":"input","y":' + tgt.toFixed(1) + '}');

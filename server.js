@@ -4,17 +4,20 @@ const { WebSocketServer } = require('ws');
 
 const W = 800, H = 450, R = 7, PW = 12, PH = 80, AX = 24, BX = W - 24 - PW, PSPEED = 700;
 const DT = 1 / 60, V0 = 380, VMAX = 900, MAXA = Math.PI / 3, WIN = 11;
-const EMPTY_TTL = 600e3, SPEC_CAP = 20, PORT = process.env.PORT || 8080;
-const RESERVE = +process.env.PONG_RESERVE_MS || 30e3; // lowered in tests so the lapse path is checkable
+const SPEC_CAP = 20, PORT = process.env.PORT || 8080;
+// Defaults for rooms that do not ask for their own; POST /room may override per room.
+const RESERVE = +process.env.PONG_RESERVE_MS || 30e3;
+const EMPTY_TTL = +process.env.PONG_EMPTY_TTL_MS || 600e3;
 
 const rooms = new Map();
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 const raw = (ws, s) => { if (ws && ws.readyState === 1) ws.send(s); };
 const send = (ws, o) => raw(ws, JSON.stringify(o));
 
-function makeRoom() {
+function makeRoom(reserve = RESERVE, empty = EMPTY_TTL) {
   const r = {
     id: crypto.randomBytes(6).toString('base64url'), // 8 url-safe chars
+    reserve, empty,
     sock: { a: null, b: null }, tok: { a: null, b: null }, res: { a: 0, b: 0 }, specs: new Set(),
     ball: { x: W / 2, y: H / 2, vx: 0, vy: 0 }, pad: { a: H / 2, b: H / 2 }, tgt: { a: H / 2, b: H / 2 },
     score: { a: 0, b: 0 }, status: 'wait', cd: 0, winner: null, started: false, emptySince: Date.now(),
@@ -135,7 +138,7 @@ function join(r, ws, role, token) {
   });
 
   ws.on('close', () => {
-    if (ws.slot && r.sock[ws.slot] === ws) { r.sock[ws.slot] = null; r.res[ws.slot] = Date.now() + RESERVE; }
+    if (ws.slot && r.sock[ws.slot] === ws) { r.sock[ws.slot] = null; r.res[ws.slot] = Date.now() + r.reserve; }
     else r.specs.delete(ws);
   });
 }
@@ -151,8 +154,19 @@ const server = http.createServer((req, res) => {
     }));
   }
   if (req.method === 'POST' && u.pathname === '/room') {
-    res.writeHead(200, { 'content-type': 'application/json' });
-    return res.end(JSON.stringify({ id: makeRoom().id }));
+    let body = '';
+    req.on('data', c => { body += c; if (body.length > 1000) req.destroy(); }); // unauthenticated: cap it
+    req.on('end', () => {
+      let o = {};
+      try { o = JSON.parse(body || '{}') || {}; } catch { /* junk body -> defaults */ }
+      const ms = (v, lo, hi, dflt) => (typeof v === 'number' && isFinite(v) ? clamp(v, lo, hi) : dflt);
+      // Per-room timings so a test room can exercise the reconnect and sweep paths in seconds.
+      // Worst case for an abuser: their own room forgets them faster.
+      const r = makeRoom(ms(o.reserveMs, 500, 60e3, RESERVE), ms(o.emptyMs, 1e3, 600e3, EMPTY_TTL));
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ id: r.id, reserveMs: r.reserve, emptyMs: r.empty }));
+    });
+    return;
   }
   if (req.method === 'GET' && (u.pathname === '/' || /^\/r\/[\w-]{1,16}$/.test(u.pathname))) {
     res.writeHead(200, { 'content-type': 'text/html' });
@@ -184,7 +198,7 @@ const sweepTimer = setInterval(() => { // TTL sweep
   for (const [id, r] of rooms) {
     const players = (r.sock.a ? 1 : 0) + (r.sock.b ? 1 : 0);
     if (players) r.emptySince = 0; else if (!r.emptySince) r.emptySince = now;
-    if ((!players && !r.specs.size) || (r.emptySince && now - r.emptySince > EMPTY_TTL)) {
+    if ((!players && !r.specs.size) || (r.emptySince && now - r.emptySince > r.empty)) {
       for (const ws of r.specs) ws.close(4003, 'room closed');
       rooms.delete(id);
     }
