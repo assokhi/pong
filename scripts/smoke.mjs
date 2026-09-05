@@ -28,12 +28,13 @@ async function until(fn, what, ms = 8000) {
 function open(id, role, token) {
   return new Promise((res, rej) => {
     const s = new WS(`${ws}/ws?room=${id}&role=${role}${token ? '&token=' + token : ''}`);
-    s.last = null; s.welcome = null; s.roleMsg = null; s.closed = null;
+    s.last = null; s.welcome = null; s.roleMsg = null; s.closed = null; s.bye = null;
     s.on('message', d => {
       const m = JSON.parse(d);
       if (m.type === 'state') s.last = m;
       else if (m.type === 'welcome') { s.welcome = m; res(s); }
       else if (m.type === 'role') s.roleMsg = m;
+      else if (m.type === 'bye') { s.bye = m; res(s); } // the reason travels as data; 1006 may be all the close says
     });
     s.on('close', (code, reason) => { s.closed = { code, reason: String(reason) }; res(s); });
     s.on('error', e => rej(new Error(`ws connect failed (room ${id}, role ${role}): ${e.message}`)));
@@ -65,7 +66,7 @@ const a = await open(id, 'play'), b = await open(id, 'play');
 assert(a.welcome.role === 'a' && b.welcome.role === 'b', 'slot assignment: ' + a.welcome.role + '/' + b.welcome.role);
 
 const third = await open(id, 'play');
-assert(third.closed && third.closed.code === 4001, 'third player not rejected: ' + JSON.stringify(third.closed));
+assert(third.bye && third.bye.code === 4001, 'third player not rejected: ' + JSON.stringify(third.bye || third.closed));
 
 const spec = await open(id, 'watch');
 assert(spec.welcome.role === null, 'spectator was given a slot');
@@ -131,8 +132,8 @@ assert(expiredSpec.welcome && keptSpec.welcome, 'spectators failed to join the s
 await sleep(9000);                                  // the 3 s TTL plus a whole 5 s sweep period
 await swept(abandoned.id, 'a room whose last connection left');
 await swept(expired.id, 'a room past its no-player TTL');
-assert(expiredSpec.closed && expiredSpec.closed.code === 4003,
-  'spectator not closed with 4003 when its room expired: ' + JSON.stringify(expiredSpec.closed));
+assert(expiredSpec.bye && expiredSpec.bye.code === 4003,
+  'spectator not told 4003 when its room expired: ' + JSON.stringify(expiredSpec.bye || expiredSpec.closed));
 // A room created but not yet reached must survive: the creator's browser may still be loading
 // /r/<id>, which on a slow connection easily outlasts a sweep tick.
 const late = await open(fresh.id, 'watch');

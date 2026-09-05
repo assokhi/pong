@@ -96,6 +96,14 @@ function broadcast() {
   }
 }
 
+// A proxy may swallow a close frame and leave the peer with a bare 1006 and no reason (Render
+// does). Say why in a data frame, which relays like any other traffic, then close a moment later;
+// the close code stays as a secondary signal for direct connections.
+function bye(ws, code, reason) {
+  send(ws, { type: 'bye', code, reason });
+  setTimeout(() => ws.close(code, reason), 250).unref();
+}
+
 function seat(r, ws, s) {
   r.specs.delete(ws); r.sock[s] = ws; ws.slot = s; r.res[s] = 0;
   r.tok[s] = crypto.randomBytes(9).toString('base64url');
@@ -110,10 +118,10 @@ function join(r, ws, role, token) {
     const now = Date.now();
     let s = token && ['a', 'b'].find(k => r.tok[k] === token && !r.sock[k]);
     if (!s) s = ['a', 'b'].find(k => !r.sock[k] && r.res[k] < now);
-    if (!s) return ws.close(4001, 'both paddles are taken');
+    if (!s) return bye(ws, 4001, 'both paddles are taken');
     seat(r, ws, s);
   } else {
-    if (r.specs.size >= SPEC_CAP) return ws.close(4002, 'spectator limit reached');
+    if (r.specs.size >= SPEC_CAP) return bye(ws, 4002, 'spectator limit reached');
     r.specs.add(ws);
   }
   r.everJoined = true;
@@ -205,7 +213,7 @@ const sweepTimer = setInterval(() => { // TTL sweep
     // Sweeping it there hands them a dead link to the room they just made.
     const idle = !players && !r.specs.size && (r.everJoined || now - r.createdAt > NEW_ROOM_GRACE);
     if (idle || (r.emptySince && now - r.emptySince > r.empty)) {
-      for (const ws of r.specs) ws.close(4003, 'room closed');
+      for (const ws of r.specs) bye(ws, 4003, 'room closed');
       rooms.delete(id);
     }
   }
@@ -215,7 +223,7 @@ const sweepTimer = setInterval(() => { // TTL sweep
 // progress is lost either way — 4004 just makes that legible instead of a generic disconnect.
 process.on('SIGTERM', () => {
   clearInterval(simTimer); clearInterval(castTimer); clearInterval(sweepTimer);
-  for (const ws of wss.clients) ws.close(4004, 'server restarting');
+  for (const ws of wss.clients) bye(ws, 4004, 'server restarting');
   rooms.clear();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 3000).unref(); // force-exit if a socket will not close
