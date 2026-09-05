@@ -1,0 +1,196 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pong</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #fff; overflow: hidden;
+    font: 14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  canvas { position: fixed; inset: 0; touch-action: none; }
+  #ui { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; pointer-events: none; }
+  .box { background: #000d; border: 1px solid #fff; padding: 20px 26px; text-align: center;
+    pointer-events: auto; line-height: 1.9; max-width: 90vw; }
+  button, input { font: inherit; margin: 4px; padding: 8px 14px; border: 1px solid #fff; }
+  button { background: #fff; color: #000; cursor: pointer; }
+  input { background: #000; color: #fff; width: 9em; }
+  #note { position: fixed; top: 8px; left: 0; right: 0; text-align: center; opacity: .8; }
+  .link { user-select: all; opacity: .7; font-size: 12px; word-break: break-all; }
+</style>
+<canvas id="c"></canvas>
+<div id="ui"></div>
+<div id="note"></div>
+<script>
+const cv = document.getElementById('c'), ctx = cv.getContext('2d'), uiEl = document.getElementById('ui');
+const noteEl = document.getElementById('note');
+const roomId = location.pathname.startsWith('/r/') ? location.pathname.slice(3) : '';
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, u) => a + (b - a) * u;
+const V = { W: 800, H: 450, R: 7, PW: 12, PH: 80, AX: 24, BX: 764, SPEED: 700, WIN: 11 };
+const BUFFER = 100; // ms of interpolation delay
+
+let ws = null, role = null, chosen = false, buf = [], myY = V.H / 2, tgt = V.H / 2, sentY = null, sentAt = 0;
+let scale = 1, ox = 0, oy = 0, dpr = 1, uiKey = null;
+let sA = null, sB = null, su = 0; // interpolation pair, kept out of the render loop to avoid allocation
+let sScore = '0  0', sSpec = 'spectators 0', roleLabel = 'watching', lastScore = -1, lastSpec = -1;
+const CD = ['', '1', '2'];
+
+function note(t) { noteEl.textContent = t; clearTimeout(note.t); note.t = setTimeout(() => noteEl.textContent = '', 4000); }
+
+/* ---------- landing ---------- */
+if (!roomId) {
+  uiEl.innerHTML = '<div class=box><b>PONG</b><br><button id=mk>Create room</button><br>' +
+    '<input id=jid placeholder="room id"><button id=jn>Join</button></div>';
+  mk.onclick = async () => {
+    const r = await fetch('/room', { method: 'POST' });
+    location.href = '/r/' + (await r.json()).id;
+  };
+  jn.onclick = () => { if (jid.value.trim()) location.href = '/r/' + jid.value.trim(); };
+} else {
+  const tok = sessionStorage.getItem('tok:' + roomId);
+  chosen = !!tok;
+  connect(tok ? 'play' : 'watch', tok);
+}
+
+/* ---------- net ---------- */
+function connect(r, token) {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws?room=${encodeURIComponent(roomId)}&role=${r}` +
+    (token ? '&token=' + encodeURIComponent(token) : ''));
+  ws.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.type === 'welcome') { Object.assign(V, m.dims); setRole(m.role, m.token); resize(); }
+    else if (m.type === 'role') { setRole(m.role, m.token); note('you are now player ' + m.role.toUpperCase()); }
+    else if (m.type === 'state') {
+      buf.push({ t: performance.now(), s: m });
+      if (buf.length > 12) buf.shift();
+      if (role) { // reconcile local prediction against the authoritative paddle
+        const err = m.paddles[role] - myY;
+        myY += Math.abs(err) > 40 ? err : err * 0.2;
+      }
+      ui(m);
+    }
+  };
+  ws.onclose = e => {
+    if (e.code === 4001 || e.code === 4002) {
+      sessionStorage.removeItem('tok:' + roomId);
+      note(e.reason + (e.code === 4001 ? ' — watching instead' : ''));
+      if (e.code === 4001) { chosen = true; role = null; uiKey = null; return connect('watch'); }
+    }
+    role = null; uiKey = 'gone';
+    const why = e.code === 4004 ? 'server restarting — reconnect in a moment'
+      : 'disconnected' + (e.reason ? ' — ' + e.reason : '');
+    uiEl.innerHTML = '<div class=box>' + why + '<br><button onclick="location.reload()">Reconnect</button></div>';
+  };
+}
+
+function setRole(r, token) {
+  role = r;
+  roleLabel = r ? 'you: player ' + r.toUpperCase() : 'watching';
+  if (token) sessionStorage.setItem('tok:' + roomId, token);
+  if (r && buf.length) myY = tgt = buf[buf.length - 1].s.paddles[r];
+  sentY = null; uiKey = null;
+}
+
+/* ---------- overlay (only touched when its state changes) ---------- */
+function ui(s) {
+  let key, html;
+  if (!role && !chosen && s.open) {
+    key = 'choice';
+    html = '<div class=box>a paddle is free<br><button id=bp>Play</button><button id=bw>Watch</button>' +
+      '<div class=link>' + location.href + '</div></div>';
+  } else if (s.status === 'over') {
+    key = 'over' + s.winner + s.score.a + s.score.b;
+    html = '<div class=box>' + (s.winner === 'a' ? 'LEFT' : 'RIGHT') + ' WINS ' + s.score.a + '–' + s.score.b +
+      (role ? '<br><button id=br>Rematch</button>' : '<br>waiting for a rematch…') + '</div>';
+  } else if (!role && s.open) {
+    key = 'claim';
+    html = '<div class=box>a paddle is empty<br><button id=bc>Take the empty paddle</button></div>';
+  } else if (s.status === 'wait') {
+    key = 'wait';
+    html = '<div class=box>waiting for an opponent…<div class=link>' + location.href + '</div></div>';
+  } else if (s.status === 'paused') {
+    key = 'paused';
+    html = '<div class=box>opponent disconnected…<br>slot reserved 30s, then anyone watching can take it</div>';
+  } else { key = 'none'; html = ''; }
+
+  if (key === uiKey) return;
+  uiKey = key; uiEl.innerHTML = html;
+  const $ = id => uiEl.querySelector('#' + id);
+  if ($('bp')) $('bp').onclick = () => { chosen = true; uiKey = null; ws.onclose = null; ws.close(); connect('play'); };
+  if ($('bw')) $('bw').onclick = () => { chosen = true; uiKey = null; uiEl.innerHTML = ''; };
+  if ($('bc')) $('bc').onclick = () => ws.send('{"type":"claim"}');
+  if ($('br')) $('br').onclick = () => ws.send('{"type":"rematch"}');
+}
+
+/* ---------- input (players only) ---------- */
+const keys = Object.create(null);
+const toY = cy => clamp((cy * dpr - oy) / scale, V.PH / 2, V.H - V.PH / 2);
+addEventListener('mousemove', e => { if (role) tgt = toY(e.clientY); });
+addEventListener('touchmove', e => { if (role) { tgt = toY(e.touches[0].clientY); e.preventDefault(); } }, { passive: false });
+addEventListener('keydown', e => { keys[e.key] = 1; if (e.key.startsWith('Arrow')) e.preventDefault(); });
+addEventListener('keyup', e => { keys[e.key] = 0; });
+addEventListener('resize', resize);
+
+function resize() {
+  dpr = devicePixelRatio || 1;
+  cv.width = innerWidth * dpr; cv.height = innerHeight * dpr;
+  cv.style.width = innerWidth + 'px'; cv.style.height = innerHeight + 'px';
+  scale = Math.min(cv.width / V.W, cv.height / V.H);       // letterbox, never simulate in pixels
+  ox = (cv.width - V.W * scale) / 2; oy = (cv.height - V.H * scale) / 2;
+}
+resize();
+
+/* ---------- render ---------- */
+function sample(now) {
+  const rt = now - BUFFER;
+  let i = buf.length - 1;
+  while (i > 0 && buf[i].t > rt) i--;
+  sA = buf[i].s; sB = buf[i + 1] ? buf[i + 1].s : buf[i].s;
+  su = buf[i + 1] ? clamp((rt - buf[i].t) / (buf[i + 1].t - buf[i].t || 1), 0, 1) : 0;
+}
+
+let prev = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(0.05, (now - prev) / 1000); prev = now;
+
+  if (role) { // local prediction of my own paddle
+    const k = (keys.ArrowUp || keys.w || keys.W ? -1 : 0) + (keys.ArrowDown || keys.s || keys.S ? 1 : 0);
+    if (k) tgt = clamp(tgt + k * V.SPEED * dt, V.PH / 2, V.H - V.PH / 2);
+    myY += clamp(tgt - myY, -V.SPEED * dt, V.SPEED * dt);
+    if (tgt !== sentY && now - sentAt >= 16 && ws.readyState === 1) { // capped at ~60 msg/s
+      ws.send('{"type":"input","y":' + tgt.toFixed(1) + '}');
+      sentY = tgt; sentAt = now;
+    }
+  }
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, cv.width, cv.height);
+  if (!buf.length) return;
+  sample(now);
+  const s = buf[buf.length - 1].s;
+
+  ctx.setTransform(scale, 0, 0, scale, ox, oy);
+  ctx.fillStyle = '#222';
+  for (let y = 6; y < V.H; y += 26) ctx.fillRect(V.W / 2 - 1, y, 2, 14);
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(V.AX, (role === 'a' ? myY : lerp(sA.paddles.a, sB.paddles.a, su)) - V.PH / 2, V.PW, V.PH);
+  ctx.fillRect(V.BX, (role === 'b' ? myY : lerp(sA.paddles.b, sB.paddles.b, su)) - V.PH / 2, V.PW, V.PH);
+  if (s.status !== 'over') {
+    const bx = lerp(sA.ball.x, sB.ball.x, su), by = lerp(sA.ball.y, sB.ball.y, su);
+    ctx.fillRect(bx - V.R, by - V.R, V.R * 2, V.R * 2);
+  }
+
+  if (s.score.a * 100 + s.score.b !== lastScore) {
+    lastScore = s.score.a * 100 + s.score.b; sScore = s.score.a + '  ' + s.score.b;
+  }
+  ctx.font = 'bold 44px ui-monospace, monospace'; ctx.textAlign = 'center';
+  ctx.fillText(sScore, V.W / 2, 52);
+  if (s.status === 'count') ctx.fillText(CD[Math.ceil(s.cd)] || '', V.W / 2, V.H / 2 + 16);
+
+  if (s.spectators !== lastSpec) { lastSpec = s.spectators; sSpec = 'spectators ' + s.spectators; }
+  ctx.font = '14px ui-monospace, monospace'; ctx.textAlign = 'left';
+  ctx.fillText(sSpec, 8, V.H - 10);
+  ctx.textAlign = 'right';
+  ctx.fillText(roleLabel, V.W - 8, V.H - 10);
+}
+requestAnimationFrame(frame);
+</script>

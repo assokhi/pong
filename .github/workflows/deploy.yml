@@ -1,0 +1,125 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: node --check server.js
+      - run: npm test
+      - name: Smoke test against a local server
+        env:
+          PONG_RESERVE_MS: "1000" # short reservation so the claim-after-lapse path is covered
+        run: |
+          set -euo pipefail
+          node server.js & echo $! > server.pid
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8080/health > /dev/null; then break; fi
+            sleep 1
+          done
+          node scripts/smoke.mjs http://127.0.0.1:8080
+          kill "$(cat server.pid)"
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Cancelling mid-rollout would leave the service in a state this workflow cannot reason about.
+    concurrency:
+      group: deploy-main
+      cancel-in-progress: false
+    env:
+      RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+      SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
+      APP_URL: ${{ secrets.APP_URL }}
+      API: https://api.render.com/v1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+
+      - name: Record the currently live deploy (rollback target)
+        id: prev
+        run: |
+          set -euo pipefail
+          prev=$(curl -sS -f -H "Authorization: Bearer $RENDER_API_KEY" \
+            "$API/services/$SERVICE_ID/deploys?limit=20" \
+            | jq -r '[.[].deploy | select(.status == "live")] | .[0].id // ""')
+          echo "rollback target: ${prev:-none (first deploy)}"
+          echo "id=$prev" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy this commit
+        id: trigger
+        run: |
+          set -euo pipefail
+          # the specific SHA, not "latest on branch": a push landing mid-run must not ship untested code
+          deploy=$(curl -sS -f -X POST -H "Authorization: Bearer $RENDER_API_KEY" \
+            -H 'content-type: application/json' \
+            -d "{\"commitId\": \"$GITHUB_SHA\", \"clearCache\": \"do_not_clear\"}" \
+            "$API/services/$SERVICE_ID/deploys" | jq -r '.id // ""')
+          if [ -z "$deploy" ]; then echo "no deploy id in the response"; exit 1; fi
+          echo "deploy $deploy for $GITHUB_SHA"
+          echo "id=$deploy" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for the deploy to go live
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            status=$(curl -sS -f -H "Authorization: Bearer $RENDER_API_KEY" \
+              "$API/services/$SERVICE_ID/deploys/${{ steps.trigger.outputs.id }}" | jq -r '.status')
+            echo "deploy status: $status"
+            case "$status" in
+              live) exit 0 ;;
+              build_failed|update_failed|pre_deploy_failed|canceled) echo "deploy failed: $status"; exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "timed out after 10 minutes waiting for the deploy to go live"
+          exit 1
+
+      - name: Wait for /health to report this commit
+        run: |
+          set -euo pipefail
+          # generous first timeout: a free-tier instance with no traffic takes ~60s to wake
+          for i in $(seq 1 30); do
+            version=$(curl -sS --max-time 90 "$APP_URL/health" | jq -r '.version // ""' || echo "")
+            echo "live version: ${version:-unreachable}"
+            if [ "$version" = "$GITHUB_SHA" ]; then exit 0; fi
+            sleep 5
+          done
+          echo "/health never reported $GITHUB_SHA — the old process may still be serving traffic"
+          exit 1
+
+      - name: Smoke test the live deployment
+        run: node scripts/smoke.mjs "$APP_URL"
+
+      - name: Roll back on failure
+        if: failure()
+        run: |
+          set -euo pipefail
+          prev='${{ steps.prev.outputs.id }}'
+          if [ -z "$prev" ]; then
+            echo "no rollback target was recorded (first deploy, or the lookup itself failed):"
+            echo "nothing to roll back to, and the broken version is live."
+            exit 1
+          fi
+          # rollback reuses the old build artifact instead of rebuilding, so recovery does not
+          # reintroduce build-time risk during an incident
+          curl -sS -f -X POST -H "Authorization: Bearer $RENDER_API_KEY" \
+            -H 'content-type: application/json' \
+            -d "{\"deployId\": \"$prev\"}" "$API/services/$SERVICE_ID/rollback" > /dev/null
+          echo "rolled back to $prev"
+          exit 1

@@ -1,0 +1,12 @@
+{
+  "name": "pong",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "test": "node server.js --selftest",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

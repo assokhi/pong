@@ -1,0 +1,18 @@
+# Rooms live in an in-memory Map, so this service is single-instance by design:
+# two instances would hold different room registries with no way to route a joiner
+# to the right one. Never add autoscaling or raise numInstances.
+services:
+  - type: web
+    name: pong
+    runtime: node
+    plan: free
+    region: singapore # closest Render region to northern India
+    branch: main
+    autoDeploy: false # deploys go only through the tested CI path
+    buildCommand: npm ci
+    startCommand: node server.js
+    healthCheckPath: /health
+    numInstances: 1
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
