@@ -35,9 +35,13 @@ Controls (players only): mouse, touch, arrow keys, or W/S.
 - A player disconnecting pauses the game and reserves their slot for 30 s. They
   can reconnect with the token in `sessionStorage`. After 30 s the slot opens and
   any spectator can claim it — first claim wins, play resumes.
-- Rooms are in-memory, swept every 5 s: dropped when they have no connections at
-  all, or after 10 minutes with no player in either slot. A room with spectators
+- Rooms are in-memory, swept every 5 s: dropped once everyone who was in them has
+  left, or after 10 minutes with no player in either slot. A room with spectators
   but no player survives until that second timeout.
+- A room nobody has connected to yet is exempt from the first rule for 60 s. Its
+  creator's browser is still loading `/r/<id>`, and on a slow connection that
+  outlasts a sweep tick — sweeping it there hands them a dead link to the room
+  they just made.
 - Both windows are per room: `POST /room` may shorten them (see below), which is
   how the smoke test covers the claim and sweep paths in seconds instead of
   minutes. This is deliberately unauthenticated — the worst anyone can do is make

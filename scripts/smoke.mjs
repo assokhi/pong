@@ -36,7 +36,7 @@ function open(id, role, token) {
       else if (m.type === 'role') s.roleMsg = m;
     });
     s.on('close', (code, reason) => { s.closed = { code, reason: String(reason) }; res(s); });
-    s.on('error', rej);
+    s.on('error', e => rej(new Error(`ws connect failed (room ${id}, role ${role}): ${e.message}`)));
   });
 }
 
@@ -117,21 +117,29 @@ await until(() => a.last.spectators === 0, 'claimer to stop counting as a specta
 await until(() => ['count', 'play'].includes(a.last.status), 'play to resume on claim');
 a.close(); spec.close();
 
-// room lifecycle sweep. Runs last and in parallel: it costs one 5 s sweep interval.
-const empty = await post({});                       // nobody ever connects -> swept as unused
-const expired = await post({ emptyMs: 1000 });      // spectators, no player, short no-player TTL
+// Room lifecycle sweep. Runs last: it costs a no-player TTL plus a full sweep period.
+const fresh = await post({});                       // created, nobody has connected to it yet
+const abandoned = await post({});                   // joined, then everyone leaves
+const leaver = await open(abandoned.id, 'watch');
+assert(leaver.welcome, 'could not join the abandoned-room fixture');
+leaver.close();
+const expired = await post({ emptyMs: 3000 });      // spectator, no player, short no-player TTL
 const expiredSpec = await open(expired.id, 'watch');
-const kept = await post({});                        // spectators, no player, default 10 min TTL
+const kept = await post({});                        // spectator, no player, default 10 min TTL
 const keptSpec = await open(kept.id, 'watch');
 assert(expiredSpec.welcome && keptSpec.welcome, 'spectators failed to join the sweep-test rooms');
-await sleep(6500);                                  // one full sweep cycle plus slack
-await swept(empty.id, 'a room nobody joined');
+await sleep(9000);                                  // the 3 s TTL plus a whole 5 s sweep period
+await swept(abandoned.id, 'a room whose last connection left');
 await swept(expired.id, 'a room past its no-player TTL');
 assert(expiredSpec.closed && expiredSpec.closed.code === 4003,
   'spectator not closed with 4003 when its room expired: ' + JSON.stringify(expiredSpec.closed));
+// A room created but not yet reached must survive: the creator's browser may still be loading
+// /r/<id>, which on a slow connection easily outlasts a sweep tick.
+const late = await open(fresh.id, 'watch');
+assert(late.welcome, 'a room was swept before anyone could connect to it');
 const rejoin = await open(kept.id, 'watch');
 assert(rejoin.welcome, 'a spectator-only room was swept before its no-player TTL');
-rejoin.close(); keptSpec.close();
+late.close(); rejoin.close(); keptSpec.close();
 
 console.log('smoke ok against ' + base);
 process.exit(0);

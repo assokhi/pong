@@ -5,6 +5,7 @@ const { WebSocketServer } = require('ws');
 const W = 800, H = 450, R = 7, PW = 12, PH = 80, AX = 24, BX = W - 24 - PW, PSPEED = 700;
 const DT = 1 / 60, V0 = 380, VMAX = 900, MAXA = Math.PI / 3, WIN = 11;
 const SPEC_CAP = 20, PORT = process.env.PORT || 8080;
+const NEW_ROOM_GRACE = 60e3; // a just-created room has not been reached by its creator yet
 // Defaults for rooms that do not ask for their own; POST /room may override per room.
 const RESERVE = +process.env.PONG_RESERVE_MS || 30e3;
 const EMPTY_TTL = +process.env.PONG_EMPTY_TTL_MS || 600e3;
@@ -17,7 +18,7 @@ const send = (ws, o) => raw(ws, JSON.stringify(o));
 function makeRoom(reserve = RESERVE, empty = EMPTY_TTL) {
   const r = {
     id: crypto.randomBytes(6).toString('base64url'), // 8 url-safe chars
-    reserve, empty,
+    reserve, empty, createdAt: Date.now(), everJoined: false,
     sock: { a: null, b: null }, tok: { a: null, b: null }, res: { a: 0, b: 0 }, specs: new Set(),
     ball: { x: W / 2, y: H / 2, vx: 0, vy: 0 }, pad: { a: H / 2, b: H / 2 }, tgt: { a: H / 2, b: H / 2 },
     score: { a: 0, b: 0 }, status: 'wait', cd: 0, winner: null, started: false, emptySince: Date.now(),
@@ -115,6 +116,7 @@ function join(r, ws, role, token) {
     if (r.specs.size >= SPEC_CAP) return ws.close(4002, 'spectator limit reached');
     r.specs.add(ws);
   }
+  r.everJoined = true;
   send(ws, {
     type: 'welcome', room: r.id, role: ws.slot, token: ws.slot ? r.tok[ws.slot] : null,
     dims: { W, H, R, PW, PH, AX, BX, SPEED: PSPEED, WIN },
@@ -198,7 +200,11 @@ const sweepTimer = setInterval(() => { // TTL sweep
   for (const [id, r] of rooms) {
     const players = (r.sock.a ? 1 : 0) + (r.sock.b ? 1 : 0);
     if (players) r.emptySince = 0; else if (!r.emptySince) r.emptySince = now;
-    if ((!players && !r.specs.size) || (r.emptySince && now - r.emptySince > r.empty)) {
+    // "Idle" means everyone left. A room nobody has reached yet is not idle, it is new: the
+    // creator's browser is still loading /r/<id>, which on a slow phone outlasts a sweep tick.
+    // Sweeping it there hands them a dead link to the room they just made.
+    const idle = !players && !r.specs.size && (r.everJoined || now - r.createdAt > NEW_ROOM_GRACE);
+    if (idle || (r.emptySince && now - r.emptySince > r.empty)) {
       for (const ws of r.specs) ws.close(4003, 'room closed');
       rooms.delete(id);
     }
