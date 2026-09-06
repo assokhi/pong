@@ -78,6 +78,7 @@ Malformed JSON, unknown types, and non-finite `y` are dropped silently.
 | `welcome` | `{room, role: "a"\|"b"\|null, token: string\|null, dims:{W,H,R,PW,PH,AX,BX,SPEED,WIN}}` | once on connect. `role: null` means spectator; `token` reclaims the slot within the 30 s reservation |
 | `state` | `{ball:{x,y,vx,vy}, paddles:{a,b}, score:{a,b}, spectators:int, open:bool, status, cd, winner, t}` | everyone in the room, 25 Hz, serialized once per room per tick |
 | `role` | `{role:"a"\|"b", token}` | the socket whose `claim` succeeded; it switches to player mode |
+| `bye` | `{code, reason}` | any socket the server is about to close, sent ~250 ms before the close frame. Proxies (Render's included) may swallow a close frame and leave the peer with a bare `1006` and no reason, so the reason travels as ordinary data and the close code is only a fallback. Clients and the smoke test key off this message |
 
 `status` is one of `wait` (no second player yet), `count` (serving, `cd` seconds
 left), `play`, `paused` (a player dropped), `over` (`winner` is `"a"`/`"b"`).
@@ -93,6 +94,11 @@ button. `t` is the server's send time.
 | `4002` | `spectator limit reached` (cap 20) |
 | `4003` | `room closed` (TTL sweep) |
 | `4004` | `server restarting` (SIGTERM) — the client says so instead of showing a generic disconnect |
+
+Each of these arrives first as a `bye` message and then as the close code. Do not
+depend on the close code alone: a proxy that drops the close frame turns every one
+of them into `1006`, and a client reading only the code would treat "room full" as
+a network blip and retry in a loop.
 
 ## Client rendering
 
@@ -123,6 +129,9 @@ rejoins. After 30 s it stops and offers a manual button. Deliberate closes never
 enter that loop: `4001` falls straight back to watching, `4002` and `4003` show
 the reason with a manual button, and `4004` says the server is restarting and
 enables its button after 8 s, since the replacement instance needs time to boot.
+Which case it is comes from the `bye` message when there is one, falling back to
+the close code, so a proxy that eats close frames cannot turn a deliberate refusal
+into a retry loop.
 
 ## Deployment
 
