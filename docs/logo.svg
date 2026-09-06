@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 440" width="1240" height="440" role="img" aria-label="Pong">
+  <defs>
+    <linearGradient id="card" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0" stop-color="#0d1512"/>
+      <stop offset="1" stop-color="#05080a"/>
+    </linearGradient>
+    <radialGradient id="ballGlow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0"    stop-color="#8dffb0" stop-opacity="0.42"/>
+      <stop offset="0.45" stop-color="#3ddc84" stop-opacity="0.13"/>
+      <stop offset="1"    stop-color="#3ddc84" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="soft" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="5"/>
+    </filter>
+  </defs>
+
+  <rect width="1240" height="440" rx="30" fill="url(#card)"/>
+  <rect x="1" y="1" width="1238" height="438" rx="29" fill="none" stroke="#1d2b25" stroke-width="2"/>
+
+  <!-- court walls -->
+  <line x1="62" y1="54"  x2="1178" y2="54"  stroke="#22352c" stroke-width="3"/>
+  <line x1="62" y1="396" x2="1178" y2="396" stroke="#22352c" stroke-width="3"/>
+
+  <!-- rally: leaves paddle A, bounces off the top wall, arrives at the ball -->
+  <path d="M 100 292 L 369 60 L 542 209" fill="none" stroke="#3ddc84" stroke-opacity="0.30"
+        stroke-width="3" stroke-dasharray="9 12" stroke-linecap="round"/>
+  <circle cx="369" cy="60" r="5" fill="#3ddc84" fill-opacity="0.65"/>
+
+  <!-- paddles -->
+  <rect x="70"   y="200" width="26" height="160" rx="11" fill="#e6fff0" opacity="0.92"/>
+  <rect x="1144" y="98"  width="26" height="160" rx="11" fill="#e6fff0" opacity="0.92"/>
+
+  <!-- wordmark: every stroke is a paddle, and the O is the ball -->
+  <g transform="translate(312.5 94.4) scale(1.42)" fill="none" stroke="#eafff2"
+     stroke-width="22" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M 11 140 V 11 H 50 A 32 32 0 0 1 50 75 H 11"/>
+    <path transform="translate(231 0)" d="M 11 140 V 11 L 75 140 V 11"/>
+    <path transform="translate(343.8 0)" d="M 78 38 A 35 64.5 0 1 0 78 113 V 84 H 55"/>
+  </g>
+
+  <circle cx="542.5" cy="209.4" r="118" fill="url(#ballGlow)"/>
+  <circle cx="542.5" cy="209.4" r="66" fill="#b7ffcc" filter="url(#soft)" opacity="0.45"/>
+  <circle cx="542.5" cy="209.4" r="64" fill="#f2fff6"/>
+
+  <text x="620" y="374" text-anchor="middle" font-family="Consolas, 'DejaVu Sans Mono', monospace"
+        font-size="20" letter-spacing="7" fill="#5f8a75">TWO PLAYERS · MANY SPECTATORS · ONE LINK</text>
+</svg>

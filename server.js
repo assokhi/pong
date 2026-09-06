@@ -18,7 +18,7 @@ const send = (ws, o) => raw(ws, JSON.stringify(o));
 function makeRoom(reserve = RESERVE, empty = EMPTY_TTL) {
   const r = {
     id: crypto.randomBytes(6).toString('base64url'), // 8 url-safe chars
-    reserve, empty, createdAt: Date.now(), everJoined: false,
+    reserve, empty, createdAt: Date.now(), everJoined: false, lag: { a: 0, b: 0 }, lagSent: { a: 0, b: 0 },
     sock: { a: null, b: null }, tok: { a: null, b: null }, res: { a: 0, b: 0 }, specs: new Set(),
     ball: { x: W / 2, y: H / 2, vx: 0, vy: 0 }, pad: { a: H / 2, b: H / 2 }, tgt: { a: H / 2, b: H / 2 },
     score: { a: 0, b: 0 }, status: 'wait', cd: 0, winner: null, started: false, emptySince: Date.now(),
@@ -104,6 +104,19 @@ function bye(ws, code, reason) {
   setTimeout(() => ws.close(code, reason), 250).unref();
 }
 
+// How old was the world this input was answering? Clients echo the timestamp of the newest
+// snapshot they had, so this is one round trip plus the snapshot's own age. The client needs it
+// to draw the ball where it is now rather than where it was when the packet left.
+function measureLag(r, s, ws, ms) {
+  if (!(ms >= 0 && ms < 5000)) return;                     // junk, or a clock from another era
+  const v = clamp(ms, 0, 250);                             // ponytail: client-influenced, so capped
+  r.lag[s] = r.lag[s] ? r.lag[s] * 0.8 + v * 0.2 : v;
+  const now = Date.now();
+  if (now - r.lagSent[s] < 2000) return;
+  r.lagSent[s] = now;
+  send(ws, { type: 'lag', ms: Math.round(r.lag[s]) });
+}
+
 function seat(r, ws, s) {
   r.specs.delete(ws); r.sock[s] = ws; ws.slot = s; r.res[s] = 0;
   r.tok[s] = crypto.randomBytes(9).toString('base64url');
@@ -136,6 +149,7 @@ function join(r, ws, role, token) {
     if (m.type === 'input') {
       if (!mine || typeof m.y !== 'number' || !isFinite(m.y)) return;
       r.tgt[ws.slot] = clamp(m.y, PH / 2, H - PH / 2);
+      if (typeof m.ack === 'number') measureLag(r, ws.slot, ws, Date.now() - m.ack);
     } else if (m.type === 'claim') {
       if (mine) return;
       const s = ['a', 'b'].find(k => !r.sock[k] && r.res[k] < Date.now());

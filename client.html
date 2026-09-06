@@ -28,10 +28,12 @@ const BUFFER = 100; // ms of interpolation delay
 
 let ws = null, role = null, chosen = false, buf = [], myY = V.H / 2, tgt = V.H / 2, sentY = null, sentAt = 0;
 let lastTgt = null, tgtAt = 0; // when the player last asked the paddle to go somewhere new
+let ackT = 0, rttMs = 0;      // newest snapshot's server time, and the round trip the server measured
 let scale = 1, ox = 0, oy = 0, dpr = 1, uiKey = null;
 let sA = null, sB = null, su = 0; // interpolation pair, kept out of the render loop to avoid allocation
 let sScore = '0  0', sSpec = 'spectators 0', roleLabel = 'watching', lastScore = -1, lastSpec = -1;
 const CD = ['', '1', '2'];
+const TAU = Math.PI * 2;
 
 function note(t) { noteEl.textContent = t; clearTimeout(note.t); note.t = setTimeout(() => noteEl.textContent = '', 4000); }
 
@@ -85,8 +87,10 @@ function connect(r, token) {
       if (uiKey === 'gone') { uiKey = null; uiEl.innerHTML = ''; } // clear "reconnecting…"
     }
     else if (m.type === 'role') { setRole(m.role, m.token); note('you are now player ' + m.role.toUpperCase()); }
+    else if (m.type === 'lag') rttMs = m.ms;
     else if (m.type === 'bye') { farewell = m; sock.close(); }
     else if (m.type === 'state') {
+      ackT = m.t;
       buf.push({ t: performance.now(), s: m });
       if (buf.length > 12) buf.shift();
       if (role) reconcile(m.paddles[role]);
@@ -208,7 +212,7 @@ function frame(now) {
     if (tgt !== lastTgt) { lastTgt = tgt; tgtAt = now; } // mouse, touch and keys all land here
     myY += clamp(tgt - myY, -V.SPEED * dt, V.SPEED * dt);
     if (tgt !== sentY && now - sentAt >= 16 && ws.readyState === 1) { // capped at ~60 msg/s
-      ws.send('{"type":"input","y":' + tgt.toFixed(1) + '}');
+      ws.send('{"type":"input","y":' + tgt.toFixed(1) + ',"ack":' + ackT + '}');
       sentY = tgt; sentAt = now;
     }
   }
@@ -226,8 +230,25 @@ function frame(now) {
   ctx.fillRect(V.AX, (role === 'a' ? myY : lerp(sA.paddles.a, sB.paddles.a, su)) - V.PH / 2, V.PW, V.PH);
   ctx.fillRect(V.BX, (role === 'b' ? myY : lerp(sA.paddles.b, sB.paddles.b, su)) - V.PH / 2, V.PW, V.PH);
   if (s.status !== 'over') {
-    const bx = lerp(sA.ball.x, sB.ball.x, su), by = lerp(sA.ball.y, sB.ball.y, su);
-    ctx.fillRect(bx - V.R, by - V.R, V.R * 2, V.R * 2);
+    // Paddles are interpolated from the past, but the ball must not be: between bounces it flies
+    // in a straight line, so where it is *now* follows exactly from the newest snapshot. Drawing
+    // it in the past let the server award points while the ball still looked a tenth of the field
+    // short of the paddle — the player saw a shot they could still reach, and lost it anyway.
+    let bx = s.ball.x, by = s.ball.y;
+    if (s.status === 'play') {
+      const age = Math.min((now - buf[buf.length - 1].t + rttMs / 2) / 1000, 0.25);
+      bx += s.ball.vx * age;
+      by += s.ball.vy * age;
+      if (by < V.R) by = 2 * V.R - by;                        // walls bounce predictably
+      else if (by > V.H - V.R) by = 2 * (V.H - V.R) - by;
+      // Contact is the server's call, so never run the ball past a paddle ahead of the verdict.
+      const fa = V.AX + V.PW + V.R, fb = V.BX - V.R;
+      if (s.ball.x >= fa && bx < fa) bx = fa;
+      if (s.ball.x <= fb && bx > fb) bx = fb;
+    }
+    ctx.beginPath();
+    ctx.arc(bx, by, V.R, 0, TAU);   // R is the server's collision radius, so this is the real shape
+    ctx.fill();
   }
 
   if (s.score.a * 100 + s.score.b !== lastScore) {
