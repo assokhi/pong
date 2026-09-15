@@ -21,9 +21,11 @@ import assert from 'node:assert';
 import net from 'node:net';
 import { spawn } from 'node:child_process';
 import WS from 'ws';
+import { replay, quant } from './netmath.mjs';
 
 const SRV = 8090, PROXY = 9090;
 const DELAY = 150, JITTER = 50, LOSS = 0.03;
+const TOKEN = 'impaired-test-token';
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const kids = [];
 
@@ -62,14 +64,16 @@ const portUp = (port, ms = 15000) => new Promise((res, rej) => {
 function watch(port, id, role, token) {
   return new Promise((res, rej) => {
     const s = new WS(`ws://127.0.0.1:${port}/ws?room=${id}&role=${role}${token ? '&token=' + token : ''}`);
-    s.arrivals = []; s.stamps = []; s.lag = null; s.last = null; s.welcome = null; s.bad = null;
+    s.arrivals = []; s.stamps = []; s.events = []; s.lag = null; s.last = null;
+    s.welcome = null; s.bad = null;
     let score = -1;
     s.on('message', d => {
       const m = JSON.parse(d);
       if (m.type === 'welcome') { s.welcome = m; return res(s); }
-      if (m.type === 'lag') { s.lag = m.ms; return; }
+      if (m.type === 'lag') { s.lag = m.ms; s.events.push({ at: Date.now(), m }); return; }
       if (m.type !== 'state') return;
-      s.arrivals.push(Date.now()); s.stamps.push(m.t); s.last = m;
+      const at = Date.now();
+      s.arrivals.push(at); s.stamps.push(m.t); s.events.push({ at, m }); s.last = m;
       if (!(m.ball.y >= 0 && m.ball.y <= 450)) s.bad = 'ball left the box vertically: ' + m.ball.y;
       if (!(m.ball.x >= -50 && m.ball.x <= 850)) s.bad = 'ball left the box horizontally: ' + m.ball.x;
       const tot = m.score.a * 100 + m.score.b;
@@ -85,7 +89,8 @@ const pick = (xs, q) => [...xs].sort((a, b) => a - b)[Math.min(xs.length - 1, Ma
 // Absolute cadence numbers are a property of the host, not of this code: Node's timers quantise to
 // the platform clock (~15.6ms on Windows), so a 40ms interval really lands near 47ms there. Every
 // assertion below therefore compares the impaired run against the clean run on the same machine.
-const stats = xs => ({ med: pick(xs, 0.5), p95: pick(xs, 0.95), max: Math.max(...xs), n: xs.length });
+const r1 = v => Math.round(v * 10) / 10;   // simT gaps are exact DT multiples, so they print long
+const stats = xs => ({ med: r1(pick(xs, 0.5)), p95: r1(pick(xs, 0.95)), max: r1(Math.max(...xs)), n: xs.length });
 const show = s => `med ${s.med} p95 ${s.p95} max ${s.max} (n=${s.n})`;
 
 const room = async seed => {
@@ -98,7 +103,7 @@ const room = async seed => {
 
 /* ---------- boot ---------- */
 // A short keepalive beat so RTT is resampled often enough to assert on inside the test window.
-boot(['server.js'], { PORT: String(SRV), PONG_BEAT_MS: '1000' }, 'server');
+boot(['server.js'], { PORT: String(SRV), PONG_BEAT_MS: '1000', PONG_METRICS_TOKEN: TOKEN }, 'server');
 boot(['scripts/netshape.mjs'], {
   PORT: String(PROXY), TARGET: String(SRV),
   DELAY_MS: String(DELAY), JITTER_MS: String(JITTER), LOSS: String(LOSS),
@@ -141,8 +146,19 @@ assert(!b.bad, 'impaired run (b): ' + b.bad);
 assert(a.arrivals.length > 100, 'too few snapshots got through: ' + a.arrivals.length);
 
 const arrival = stats(gaps(a.arrivals)), server = stats(gaps(a.stamps));
+
+// The payoff question: would this stream have *looked* smooth? Replaying it through the real
+// client math answers that without a browser — how far the drawn ball departed from
+// velocity x frame time, in free flight, in virtual px. This is what a player means by "jittery".
+const smooth = replay(a.events);
+const jp95 = quant(smooth.jit, 0.95), jmax = quant(smooth.jit, 1);
+const baseSmooth = replay(ca.events);
+
 console.log(`  arrival  clean: ${show(baseArrival)}\n           bad:   ${show(arrival)}`);
 console.log(`  server t clean: ${show(baseServer)}\n           bad:   ${show(server)}`);
+console.log(`  ball jitter px  clean p95 ${quant(baseSmooth.jit, 0.95).toFixed(3)} ` +
+  `max ${quant(baseSmooth.jit, 1).toFixed(3)} | bad p95 ${jp95.toFixed(3)} max ${jmax.toFixed(3)} ` +
+  `(${smooth.jit.length} frames measured, ${smooth.clamped} excluded)`);
 console.log(`  rtt ${a.lag}ms  score ${JSON.stringify(a.last.score)}  paddle ${a.last.paddles.a.toFixed(1)}`);
 
 // 1. The harness genuinely impairs. Without this, a green run could mean the proxy did nothing.
@@ -165,6 +181,14 @@ assert(server.max / server.med < arrival.max / arrival.med / 2,
   `the server timeline is as bursty as its delivery (${(server.max / server.med).toFixed(1)}x vs ` +
   `${(arrival.max / arrival.med).toFixed(1)}x), so the client's link is reaching the simulation`);
 
+// 2b. And it would have looked smooth. A bad link changes when frames arrive, never where the ball
+//     is at a given instant, so extrapolation off an honestly-stamped snapshot stays continuous
+//     through a burst. Sub-pixel here; ~5px if snapshots are stamped at broadcast instead of at the
+//     simulation instant, which is the defect this number was added to catch.
+assert(smooth.jit.length > 200, 'too few measurable frames to judge smoothness: ' + smooth.jit.length);
+assert(jp95 < 1, `the ball would not have looked smooth: p95 ${jp95.toFixed(2)}px per frame`);
+assert(jmax < 4, `worst drawn frame was ${jmax.toFixed(2)}px off a straight line`);
+
 // 3. RTT is measured here, from a ping we stamped, so it reports the link and not a client's claim.
 assert(a.lag > DELAY, 'RTT never measured the impairment: ' + a.lag + 'ms');
 assert(a.lag < 4 * (DELAY + JITTER) + 400, 'RTT is implausible: ' + a.lag + 'ms');
@@ -175,7 +199,39 @@ assert(a.last.score.a + a.last.score.b > 0, 'nobody scored in 8s of impaired pla
 assert(Math.abs(a.last.paddles.a - TARGET_Y) < 5,
   `input did not survive the link: paddle sat at ${a.last.paddles.a.toFixed(1)}, asked for ${TARGET_Y}`);
 
+/* ---------- 5. the beta telemetry path, end to end and hostile ---------- */
+// Everything here crosses a trust boundary on its way into an operator's log, so the test sends
+// the shapes an attacker would and checks what came out the other side, not just that it was taken.
+a.send(JSON.stringify({
+  type: 'telemetry', ms: 15000,
+  net: { rtt: 350, snaps: 200, gapMax: 'not a number', stalls: -3, gapMed: NaN },
+  render: { fps: 60, jitP95: 0.1, jitMax: 1e12 },
+  view: { w: 1920, h: 1080, dpr: 2 },
+  note: 'x'.repeat(900),
+  evil: { nested: 'must not survive' }, at: 'forged', room: 'forged', role: 'forged',
+}));
+await sleep(500);
+
+assert((await fetch(`http://127.0.0.1:${SRV}/metrics`)).status === 404, '/metrics served without a token');
+assert((await fetch(`http://127.0.0.1:${SRV}/metrics?token=nope`)).status === 404, '/metrics took a bad token');
+const mres = await fetch(`http://127.0.0.1:${SRV}/metrics?token=${TOKEN}`);
+assert(mres.status === 200, '/metrics refused the right token: ' + mres.status);
+const { reports } = await mres.json();
+const rec = reports[reports.length - 1];
+assert(rec, 'the telemetry frame never reached /metrics');
+assert(rec.net.rtt === 350 && rec.render.fps === 60, 'good values did not survive: ' + JSON.stringify(rec.net));
+assert(rec.net.gapMax === 0 && rec.net.gapMed === 0, 'a non-number reached the log: ' + JSON.stringify(rec.net));
+assert(rec.net.stalls === 0, 'a negative count was not clamped: ' + rec.net.stalls);
+assert(rec.render.jitMax === 1e7, 'an absurd value was not clamped: ' + rec.render.jitMax);
+assert(rec.note.length === 500, 'the note was not truncated: ' + rec.note.length);
+assert(rec.evil === undefined, 'an unknown key was copied into the log');
+assert(rec.room === bad.id && rec.role === 'a', 'a client forged its own identity: ' + rec.room + '/' + rec.role);
+assert(rec.at !== 'forged' && !isNaN(Date.parse(rec.at)), 'a client forged the timestamp: ' + rec.at);
+assert(typeof rec.ua === 'string', 'the user agent was not attached from the request headers');
+
+console.log(`  telemetry ok — ${reports.length} report(s) via /metrics, unknown keys dropped, ` +
+  `note truncated to ${rec.note.length}`);
 console.log(`impaired ok — ${DELAY}+/-${JITTER}ms, ${LOSS * 100}% loss: arrivals burst to ` +
-  `${arrival.max}ms while the server held its ${server.med}ms cadence`);
+  `${arrival.max}ms, ball jitter p95 ${jp95.toFixed(2)}px, server cadence ${server.med}ms`);
 stop();
 process.exit(0);

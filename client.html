@@ -30,22 +30,49 @@ const lerp = (a, b, u) => a + (b - a) * u;
 const V = { W: 800, H: 450, R: 7, PW: 12, PH: 80, AX: 24, BX: 764, SPEED: 700, WIN: 11 };
 let BUFFER = 100;                  // ms of interpolation delay
 let buf = [], off = null, rttMs = 0;
+let offs = [], offTarget = null, rttTarget = 0, rttSeen = false;
 let sA = null, sB = null, su = 0;  // interpolation pair, kept out of the render loop to avoid allocation
 let ballX = 0, ballY = 0;          // likewise: ballAt() writes here rather than returning a point
+let jitterPx = -1;                 // smoothness of the drawn ball this frame; -1 when not measurable
+let ballAge = 0;                   // seconds of extrapolation behind the drawn ball
+const OFFW = 64;                   // ~2.5 s of snapshots in the offset window
+const SLEW = 15;                   // ms of clock correction per second of wall time
 
 // Snapshots play back on the SERVER's clock, never on arrival time. A lost segment stalls every
 // snapshot queued behind it — this is TCP, so nothing is dropped, it is delayed — and then five
 // arrive in the same millisecond. Keyed off arrival, that burst gave five frames near-identical
 // timestamps, sample() walked back to the oldest frame still buffered, and the opponent's paddle
-// lurched backwards a third of a second before fast-forwarding through the whole burst. m.t is
-// 40 ms apart however the bytes actually turned up.
+// crawled and then lurched: 164 ms of game time in a single frame, against 10 ms once the same
+// fixture is played on m.t (scripts/predict.test.mjs measures exactly this). m.t stays 40 ms
+// apart however the bytes actually turned up.
 //
-// off is min-filtered because the least-delayed sample seen so far is the best estimate of the
-// true offset; the slow upward drift allowance lets it follow real clock skew without chasing
-// jitter back up.
+// The offset is the minimum of (local - server) over a sliding window: the least-delayed sample in
+// recent memory is the one that spent the least time in transit, so it is the closest look at the
+// true offset. A window rather than an all-time minimum, because an all-time minimum is pinned
+// forever by one anomalously fast early packet and can never recover if the server's clock moves.
 function trackClock(serverT, localNow) {
-  const o = localNow - serverT;
-  off = off === null ? o : Math.min(o, off + 0.05);   // ~1.25 ms/s of drift tolerance at 25 Hz
+  offs.push(localNow - serverT);
+  if (offs.length > OFFW) offs.shift();
+  let m = Infinity;
+  for (const v of offs) if (v < m) m = v;
+  offTarget = m;
+  if (off === null) off = m;   // cold start: adopt it, there is nothing yet to be smooth against
+}
+
+// Both the offset and the round trip are revisions to where the whole extrapolated world sits, so
+// applying one as a step teleports the ball: at 900px/s a 40ms revision moves it 18px in a single
+// frame. Bleed them in instead. 15ms/s costs a 1.5% velocity error no eye can catch and still
+// closes a 100ms correction in under seven seconds. The first measurement of each is adopted
+// outright — there is nothing to be smooth relative to yet, and starting 5s behind is worse.
+function slew(dtMs) {
+  const d = Math.min(dtMs, 100) * SLEW / 1000;
+  if (offTarget !== null) off += clamp(offTarget - off, -d, d);
+  rttMs += clamp(rttTarget - rttMs, -d * 2, d * 2);
+}
+
+function setRtt(ms) {
+  rttTarget = ms;
+  if (!rttSeen) { rttSeen = true; rttMs = ms; }
 }
 
 function pushSnap(m, localNow) {
@@ -70,18 +97,39 @@ function sample(now) {
 // off already absorbs the baseline one-way delay, so rttMs/2 is what remains to carry the ball
 // from "when this snapshot would have arrived" to "where it is now". The two terms are
 // complementary, not two spellings of the same correction.
+let pBX = 0, pBY = 0, pVX = 0, pVY = 0, pNow = 0, pClean = false;
 function ballAt(s, now) {
   ballX = s.ball.x; ballY = s.ball.y;
-  if (s.status !== 'play') return;
-  const age = Math.min((now - (s.t + off) + rttMs / 2) / 1000, 0.25);
+  if (s.status !== 'play') { pClean = false; jitterPx = -1; return; }
+  // Two different quantities, and only one of them is a risk. rtt/2 is a standing, measured
+  // correction that is always right to apply. Staleness — how long since this snapshot should have
+  // reached us — is the one that runs away when a connection dies, so it is the one that gets
+  // capped. Capping their sum instead pins the ball at the ceiling for the whole of a 300ms+ link:
+  // the extrapolation stops responding to time and the ball advances only when a snapshot lands,
+  // stepping ~16px at 21Hz. That looks exactly like the jitter the cap was supposed to prevent.
+  const stale = (now - (s.t + off)) / 1000;
+  const held = Math.min(stale, 0.25);
+  const age = ballAge = held + rttMs / 2000;
   ballX += s.ball.vx * age;
   ballY += s.ball.vy * age;
-  if (ballY < V.R) ballY = 2 * V.R - ballY;                       // walls bounce predictably
-  else if (ballY > V.H - V.R) ballY = 2 * (V.H - V.R) - ballY;
+  let clean = stale === held;                         // a capped ball is frozen, not smooth
+  if (ballY < V.R) { ballY = 2 * V.R - ballY; clean = false; }             // walls bounce predictably
+  else if (ballY > V.H - V.R) { ballY = 2 * (V.H - V.R) - ballY; clean = false; }
   // Contact is the server's call, so never run the ball past a paddle ahead of the verdict.
   const fa = V.AX + V.PW + V.R, fb = V.BX - V.R;
-  if (s.ball.x >= fa && ballX < fa) ballX = fa;
-  if (s.ball.x <= fb && ballX > fb) ballX = fb;
+  if (s.ball.x >= fa && ballX < fa) { ballX = fa; clean = false; }
+  if (s.ball.x <= fb && ballX > fb) { ballX = fb; clean = false; }
+
+  // Smoothness, measured where the word means something. In free flight the drawn ball must
+  // advance by exactly velocity x frame time; any other distance is the extrapolation
+  // contradicting itself between two frames, which is precisely what a player calls jitter.
+  // Bounces, face clamps and capped ages are excluded — those are known discontinuities, not
+  // defects, and counting them would bury the signal this number exists to carry.
+  jitterPx = (clean && pClean && pVX === s.ball.vx && pVY === s.ball.vy)
+    ? Math.hypot(ballX - pBX - s.ball.vx * (now - pNow) / 1000,
+                 ballY - pBY - s.ball.vy * (now - pNow) / 1000)
+    : -1;
+  pBX = ballX; pBY = ballY; pVX = s.ball.vx; pVY = s.ball.vy; pNow = now; pClean = clean;
 }
 /*</net>*/
 
@@ -90,9 +138,10 @@ function ballAt(s, now) {
 const qs = new URLSearchParams(location.search);
 let rttPin = false;
 if (qs.has('buffer')) BUFFER = Math.max(0, +qs.get('buffer') || 0);
-if (qs.has('rtt')) { rttMs = Math.max(0, +qs.get('rtt') || 0); rttPin = true; }
+if (qs.has('rtt')) { rttMs = rttTarget = Math.max(0, +qs.get('rtt') || 0); rttSeen = rttPin = true; }
 
-let ws = null, role = null, chosen = false, myY = V.H / 2, tgt = V.H / 2, sentY = null, sentAt = 0;
+let ws = null, role = null, chosen = false, welcomed = false, myY = V.H / 2, tgt = V.H / 2;
+let sentY = null, sentAt = 0;
 let lastTgt = null, tgtAt = 0; // when the player last asked the paddle to go somewhere new
 let scale = 1, ox = 0, oy = 0, dpr = 1, uiKey = null;
 let sScore = '0  0', sSpec = 'spectators 0', roleLabel = 'watching', lastScore = -1, lastSpec = -1;
@@ -100,6 +149,47 @@ const CD = ['', '1', '2'];
 const TAU = Math.PI * 2;
 
 function note(t) { noteEl.textContent = t; clearTimeout(note.t); note.t = setTimeout(() => noteEl.textContent = '', 4000); }
+
+/* ---------- beta telemetry ---------- */
+// What a player means by "the ball is jittery" is not a feeling the logs can hold, so the client
+// measures it: jitMed/jitP95/jitMax are how far the drawn ball departed from velocity x frame time
+// in free flight, in virtual px. On a correct stream that is ~0 whatever the network is doing, so a
+// non-zero value is a real defect and the network numbers beside it say which one.
+const CAP = 3000;                       // bound the sample arrays if a send ever fails to fire
+let tele = null;
+function resetTele() {
+  tele = { t0: performance.now(), snaps: 0, reconnects: tele ? tele.reconnects : 0,
+           gaps: [], jit: [], frames: 0, underruns: 0, clamped: 0, stalls: 0, ageMax: 0, lastAt: 0 };
+}
+resetTele();
+
+const quant = (a, p) => {
+  if (!a.length) return 0;
+  const s = [...a].sort((x, y) => x - y);
+  return +s[Math.min(s.length - 1, Math.floor(s.length * p))].toFixed(2);
+};
+
+function sendTele(text) {
+  if (!ws || ws.readyState !== 1) return;
+  const ms = Math.max(1, performance.now() - tele.t0);
+  ws.send(JSON.stringify({
+    type: 'telemetry',
+    ms: Math.round(ms),
+    net: {
+      rtt: Math.round(rttMs), snaps: tele.snaps, reconnects: tele.reconnects, stalls: tele.stalls,
+      gapMed: quant(tele.gaps, 0.5), gapP95: quant(tele.gaps, 0.95), gapMax: quant(tele.gaps, 1),
+    },
+    render: {
+      fps: Math.round(tele.frames / (ms / 1000)), samples: tele.jit.length,
+      jitMed: quant(tele.jit, 0.5), jitP95: quant(tele.jit, 0.95), jitMax: quant(tele.jit, 1),
+      underruns: tele.underruns, clamped: tele.clamped, ageMax: Math.round(tele.ageMax * 1000),
+    },
+    view: { w: innerWidth, h: innerHeight, dpr: +dpr.toFixed(2) },
+    note: text || undefined,
+  }));
+  resetTele();
+}
+setInterval(() => { if (tele.frames) sendTele(); }, 15000);
 
 /* ---------- landing ---------- */
 if (!roomId) {
@@ -148,13 +238,21 @@ function connect(r, token) {
     if (m.type === 'welcome') {
       Object.assign(V, m.dims); setRole(m.role, m.token); resize();
       attempt = 0; retryUntil = 0;
+      if (!welcomed) { welcomed = true; note('press F if anything feels wrong'); }
       if (uiKey === 'gone') { uiKey = null; uiEl.innerHTML = ''; } // clear "reconnecting…"
     }
     else if (m.type === 'role') { setRole(m.role, m.token); note('you are now player ' + m.role.toUpperCase()); }
-    else if (m.type === 'lag') { if (!rttPin) rttMs = m.ms; }
+    else if (m.type === 'lag') { if (!rttPin) setRtt(m.ms); }
     else if (m.type === 'bye') { farewell = m; sock.close(); }
     else if (m.type === 'state') {
-      pushSnap(m, performance.now());
+      const at = performance.now();
+      if (tele.lastAt) {
+        const gap = at - tele.lastAt;
+        if (tele.gaps.length < CAP) tele.gaps.push(gap);
+        if (gap > 200) tele.stalls++;      // a retransmit-sized hole in an otherwise 40ms stream
+      }
+      tele.lastAt = at; tele.snaps++;
+      pushSnap(m, at);
       if (role) reconcile(m.paddles[role]);
       ui(m);
     }
@@ -172,6 +270,7 @@ function connect(r, token) {
     if (code === 4004) return box('server restarting — reconnect in a moment', 'soon');
     if (DELIBERATE.includes(code)) return box('disconnected' + (reason ? ' — ' + reason : ''), 'now');
     // Unexpected drop (mobile handover, wifi blip): retry with backoff for ~30 s.
+    tele.reconnects++;
     if (!retryUntil) retryUntil = Date.now() + 30e3;
     if (Date.now() >= retryUntil) return box('could not reconnect', 'now');
     const wait = Math.round(Math.min(250 * 2 ** attempt, 5000) * (0.8 + Math.random() * 0.4));
@@ -241,7 +340,18 @@ const keys = Object.create(null);
 const toY = cy => clamp((cy * dpr - oy) / scale, V.PH / 2, V.H - V.PH / 2);
 addEventListener('mousemove', e => { if (role) tgt = toY(e.clientY); });
 addEventListener('touchmove', e => { if (role) { tgt = toY(e.touches[0].clientY); e.preventDefault(); } }, { passive: false });
-addEventListener('keydown', e => { keys[e.key] = 1; if (e.key.startsWith('Arrow')) e.preventDefault(); });
+addEventListener('keydown', e => {
+  keys[e.key] = 1;
+  if (e.key.startsWith('Arrow')) e.preventDefault();
+  // Beta feedback. The note travels with the session's own measurements, so a report arrives as
+  // "felt laggy near the right paddle" *next to* the numbers for that minute, rather than alone.
+  // ponytail: prompt() blocks the render loop for as long as it is open. Fine for a beta key,
+  // replace with an in-page field if it ever ships to players who did not opt into one.
+  if (e.key === 'f' || e.key === 'F') {
+    const text = prompt('What went wrong? Sent with this session\'s network and smoothness metrics.');
+    if (text && text.trim()) { sendTele(text.trim().slice(0, 500)); note('sent — thank you'); }
+  }
+});
 addEventListener('keyup', e => { keys[e.key] = 0; });
 addEventListener('resize', resize);
 
@@ -259,6 +369,7 @@ let prev = performance.now();
 function frame(now) {
   requestAnimationFrame(frame);
   const dt = Math.min(0.05, (now - prev) / 1000); prev = now;
+  slew(dt * 1000);
 
   if (role) { // local prediction of my own paddle
     const k = (keys.ArrowUp || keys.w || keys.W ? -1 : 0) + (keys.ArrowDown || keys.s || keys.S ? 1 : 0);
@@ -283,8 +394,14 @@ function frame(now) {
   ctx.fillStyle = '#fff';
   ctx.fillRect(V.AX, (role === 'a' ? myY : lerp(sA.paddles.a, sB.paddles.a, su)) - V.PH / 2, V.PW, V.PH);
   ctx.fillRect(V.BX, (role === 'b' ? myY : lerp(sA.paddles.b, sB.paddles.b, su)) - V.PH / 2, V.PW, V.PH);
+  tele.frames++;
+  if (sA === sB) tele.underruns++;   // the buffer ran dry: nothing left to interpolate toward
+
   if (s.status !== 'over') {
     ballAt(s, now);
+    if (jitterPx >= 0) { if (tele.jit.length < CAP) tele.jit.push(jitterPx); }
+    else tele.clamped++;
+    if (ballAge > tele.ageMax) tele.ageMax = ballAge;
     ctx.beginPath();
     ctx.arc(ballX, ballY, V.R, 0, TAU); // R is the server's collision radius, so this is the real shape
     ctx.fill();

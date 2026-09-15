@@ -12,7 +12,11 @@ const EMPTY_TTL = +process.env.PONG_EMPTY_TTL_MS || 600e3;
 const SNAP_MS = +process.env.PONG_SNAP_MS || 40;   // snapshot period; lower it to trade bandwidth for smoothness
 const BEAT_MS = +process.env.PONG_BEAT_MS || 5000; // keepalive period, and how often RTT is resampled
 
+const METRICS_CAP = 200;                                  // recent beta reports kept for /metrics
+const METRICS_TOKEN = process.env.PONG_METRICS_TOKEN || '';
+
 const rooms = new Map();
+const metrics = [];
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 const raw = (ws, s) => { if (ws && ws.readyState === 1) ws.send(s); };
 const send = (ws, o) => raw(ws, JSON.stringify(o));
@@ -94,13 +98,21 @@ function step(r) {
   if (r.status === 'play') sim(r, DT);
 }
 
+// The simulation's own clock, advanced by exactly one DT per step. A snapshot must be stamped with
+// this and never with Date.now(): the ball in it was last integrated at the most recent sim tick,
+// so a wall-clock stamp claims a position for a moment the ball was not at yet. The gap is the
+// unspent accumulator plus however late the timer woke up — on a coarse platform clock that reached
+// 20ms, more than a whole sim step, redrawn randomly on every snapshot. Clients extrapolate from
+// `t`, so that lands directly on the ball as jitter: ~19px of noise at top speed, 21 times a second.
+let simT = Date.now();
+
 function broadcast() {
   const now = Date.now();
   for (const r of rooms.values()) {
     const msg = JSON.stringify({ // serialized once per room per tick
       type: 'state', ball: r.ball, paddles: r.pad, score: r.score, spectators: r.specs.size,
-      open: ['a', 'b'].some(k => !r.sock[k] && r.res[k] < now),
-      status: r.status, cd: r.cd, winner: r.winner, t: now,
+      open: ['a', 'b'].some(k => !r.sock[k] && r.res[k] < now),   // reservations are wall-clock
+      status: r.status, cd: r.cd, winner: r.winner, t: simT,
     });
     raw(r.sock.a, msg); raw(r.sock.b, msg);
     for (const ws of r.specs) raw(ws, msg);
@@ -123,6 +135,28 @@ function measureLag(r, s, ws, ms) {
   if (!(ms >= 0 && ms < 30e3)) return;   // an unsolicited pong (RFC 6455 allows them) times nothing
   r.lag[s] = r.lag[s] ? r.lag[s] * 0.8 + ms * 0.2 : ms;
   send(ws, { type: 'lag', ms: Math.round(r.lag[s]) });
+}
+
+// Beta telemetry is unauthenticated client input on its way into an operator's log, so none of it
+// is copied verbatim: the record is rebuilt from a whitelist, every number coerced and clamped,
+// every string truncated. A client that lies can only lie within these bounds, and the one thing
+// it cannot do is put its own structure — or its own newlines — into the log.
+const TELE = {
+  net: ['rtt', 'snaps', 'reconnects', 'gapMed', 'gapP95', 'gapMax', 'stalls'],
+  render: ['fps', 'jitMed', 'jitP95', 'jitMax', 'samples', 'underruns', 'clamped', 'ageMax'],
+  view: ['w', 'h', 'dpr'],
+};
+const num = v => (typeof v === 'number' && isFinite(v) ? clamp(v, 0, 1e7) : 0);
+
+function tidyTelemetry(m) {
+  const out = { ms: num(m.ms) };
+  for (const g of Object.keys(TELE)) {
+    const src = m[g] && typeof m[g] === 'object' ? m[g] : {};
+    out[g] = {};
+    for (const k of TELE[g]) out[g][k] = num(src[k]);
+  }
+  if (typeof m.note === 'string' && m.note.trim()) out.note = m.note.slice(0, 500);
+  return out;
 }
 
 function seat(r, ws, s) {
@@ -173,6 +207,17 @@ function join(r, ws, role, token) {
     } else if (m.type === 'rematch') {
       if (!mine || r.status !== 'over') return;
       r.score.a = r.score.b = 0; r.winner = null; r.started = false; r.status = 'wait';
+    } else if (m.type === 'telemetry') {
+      const now = Date.now();
+      if (now - (ws.teleAt || 0) < 5000) return;   // periodic reports are 15s apart; bound the rest
+      ws.teleAt = now;
+      const rec = {
+        at: new Date(now).toISOString(), room: r.id, role: ws.slot, ua: ws.ua,
+        ...tidyTelemetry(m),
+      };
+      metrics.push(rec);
+      if (metrics.length > METRICS_CAP) metrics.shift();
+      console.log('telemetry ' + JSON.stringify(rec));   // the host captures stdout; this is the feed
     }
   });
 
@@ -191,6 +236,18 @@ const server = http.createServer((req, res) => {
       ok: true, version: process.env.RENDER_GIT_COMMIT ?? 'dev',
       rooms: rooms.size, uptime: Math.round(process.uptime()),
     }));
+  }
+  if (req.method === 'GET' && u.pathname === '/metrics') {
+    // These records carry beta players' free-text notes, so this is not public. With no token set
+    // the endpoint does not exist at all, which is the right default for somewhere to be wrong.
+    const h = s => crypto.createHash('sha256').update(s).digest();
+    const given = u.searchParams.get('token') || '';
+    if (!METRICS_TOKEN || !crypto.timingSafeEqual(h(given), h(METRICS_TOKEN))) {
+      res.writeHead(404).end('not found');
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+    return res.end(JSON.stringify({ n: metrics.length, reports: metrics }));
   }
   if (req.method === 'POST' && u.pathname === '/room') {
     let body = '';
@@ -225,7 +282,10 @@ server.on('upgrade', (req, sock, head) => {
   const r = rooms.get(u.searchParams.get('room') || '');
   if (u.pathname !== '/ws' || !r) return sock.destroy();
   const role = u.searchParams.get('role') === 'play' ? 'play' : 'watch';
-  wss.handleUpgrade(req, sock, head, ws => join(r, ws, role, u.searchParams.get('token')));
+  wss.handleUpgrade(req, sock, head, ws => {
+    ws.ua = String(req.headers['user-agent'] || '').slice(0, 120);   // attached here, not self-reported
+    join(r, ws, role, u.searchParams.get('token'));
+  });
 });
 
 // Fixed 60 Hz accumulator: measures real elapsed time, so it cannot drift like setInterval.
@@ -233,7 +293,7 @@ let last = Date.now(), acc = 0;
 const simTimer = setInterval(() => {
   const now = Date.now();
   acc = Math.min(acc + (now - last) / 1000, 0.25); last = now;
-  while (acc >= DT) { acc -= DT; for (const r of rooms.values()) step(r); }
+  while (acc >= DT) { acc -= DT; simT += DT * 1000; for (const r of rooms.values()) step(r); }
 }, 4);
 const castTimer = setInterval(broadcast, SNAP_MS); // 25 Hz snapshots by default
 

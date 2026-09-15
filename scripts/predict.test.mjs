@@ -6,26 +6,12 @@
 // build step and no second request, which is the whole premise of this repo.
 // ponytail: if the fence ever gets awkward, make it a served module and import it properly.
 import assert from 'node:assert';
-import vm from 'node:vm';
-import { readFileSync } from 'node:fs';
+import { loadNetMath, replay, quant } from './netmath.mjs';
 
 const fail = e => { console.error('PREDICT FAILED: ' + ((e && e.message) || e)); process.exit(1); };
 process.on('uncaughtException', fail);
 
-const html = readFileSync(new URL('../client.html', import.meta.url), 'utf8');
-const fence = html.match(/\/\*<net>\*\/([\s\S]*?)\/\*<\/net>\*\//);
-assert(fence, 'the /*<net>*/ fence is gone from client.html — this test lifts the net math out of it');
-
-// let/const inside a vm script do not become context properties, so the block hands back an
-// accessor object as its completion value.
-const api = vm.runInNewContext(fence[1] + `
-;({
-  trackClock, pushSnap, sample, ballAt, V,
-  get sA() { return sA }, get sB() { return sB }, get su() { return su },
-  get off() { return off }, get ballX() { return ballX }, get ballY() { return ballY },
-  set rttMs(v) { rttMs = v }, set BUFFER(v) { BUFFER = v },
-  reset(b) { buf = []; off = null; rttMs = 0; BUFFER = b; },
-})`, vm.createContext({}));
+const api = loadNetMath();
 
 const snap = (t, pa = 225, pb = 225, ball = { x: 400, y: 225, vx: 0, vy: 0 }) =>
   ({ type: 'state', t, ball, paddles: { a: pa, b: pb }, score: { a: 0, b: 0 }, status: 'play' });
@@ -82,15 +68,31 @@ assert(maxStep(ctl) > 100,
   'the control (pre-fix, arrival-time) algorithm no longer lurches on this scenario, so the ' +
   'assertions above prove nothing — the fixture needs rebuilding, not the code');
 
-/* ---------- 2. the clock offset takes the fastest sample and ignores the slow ones ---------- */
+/* ---------- 2. the clock estimate takes the fastest sample, and is never applied as a jump ---- */
 api.reset(100);
-api.trackClock(1000, 1100);                      // 100ms apparent offset
-api.trackClock(1040, 1200);                      // a delayed sample at 160ms must not drag it up
-assert(api.off < 101, 'a delayed sample moved the clock estimate: ' + api.off);
-api.trackClock(1080, 1160);                      // a faster sample at 80ms is the better estimate
-assert(Math.abs(api.off - 80) < 1e-9, 'a faster sample was not adopted: ' + api.off);
-for (let k = 0; k < 100; k++) api.trackClock(1120 + 40 * k, 1200 + 40 * k + 500); // a long slow spell
-assert(api.off > 80 && api.off < 90, 'clock drift tolerance is not tracking: ' + api.off);
+api.trackClock(1000, 1100);                      // cold start: adopt it, nothing to be smooth against
+assert(Math.abs(api.off - 100) < 1e-9, 'cold start did not adopt the first offset: ' + api.off);
+api.trackClock(1040, 1200);                      // a delayed sample at 160ms is not a better estimate
+assert(Math.abs(api.offTarget - 100) < 1e-9, 'a delayed sample moved the estimate: ' + api.offTarget);
+api.trackClock(1080, 1160);                      // a faster sample at 80ms is
+assert(Math.abs(api.offTarget - 80) < 1e-9, 'a faster sample was not taken as the target: ' + api.offTarget);
+assert(Math.abs(api.off - 100) < 1e-9, 'the offset was applied as a jump: ' + api.off);
+
+// It has to get there, and it must never get there fast: a step in the offset moves the entire
+// extrapolated world at once, which is the jitter this whole mechanism exists to avoid.
+let steps = 0;
+while (Math.abs(api.off - api.offTarget) > 1e-9 && steps++ < 10000) {
+  const was = api.off;
+  api.slew(1000 / 60);
+  assert(Math.abs(api.off - was) <= 0.25 + 1e-9,
+    'a clock correction moved ' + Math.abs(api.off - was).toFixed(3) + 'ms in a single frame');
+}
+assert(steps > 40 && steps < 120, 'a 20ms correction took ' + steps + ' frames, expected ~80');
+
+// An old minimum must eventually fall out of the window, or one lucky early packet pins the
+// estimate for the life of the session and a server clock change can never be followed.
+for (let k = 0; k < 64; k++) api.trackClock(2000 + 40 * k, 2130 + 40 * k);
+assert(Math.abs(api.offTarget - 130) < 1e-9, 'the window never forgot an old minimum: ' + api.offTarget);
 
 /* ---------- 3. the ball is extrapolated, but never past the server's verdict ---------- */
 api.reset(100);
@@ -121,6 +123,49 @@ api.ballAt(lost, 5000 + 30e3);                   // 30 seconds with no snapshot 
 assert(api.ballX <= 100 + 600 * 0.25 + 1e-9,
   'extrapolation is unbounded; a stalled connection sends the ball off the field: ' + api.ballX);
 
-console.log('predict ok — burst lurch: ' + maxStep(real).toFixed(1) + 'ms on the server timeline vs ' +
-  maxStep(ctl).toFixed(1) + 'ms on arrival time');
+/* ---------- 5. the drawn ball is smooth, and stops being smooth if snapshots lie ---------- */
+// A snapshot says "the ball was here at t". If the server stamps t at broadcast rather than at the
+// simulation instant, the position is from up to a step earlier — by a different amount each time,
+// because the broadcast timer and the sim accumulator have no fixed phase. Clients extrapolate
+// from t, so that lands on the ball directly. This is the bug players report as "it jitters".
+// One rally, staying inside the field the whole way: a ball that leaves it is all bounces and
+// clamps, and those frames are excluded by design, so such a fixture measures nothing.
+function rally(phaseMs, vx, vy, x0, y0, secs) {
+  const T0 = 1e6, ev = [];
+  // The real phase error is the sim accumulator's remainder, which is independent snapshot to
+  // snapshot. Seeded so the fixture is reproducible, but genuinely mixed: a sequence that merely
+  // creeps would put its jumps below p95 and the test would pass while measuring nothing.
+  let seed = 12345;
+  const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  for (let k = 0; k < Math.floor(secs * 25); k++) {
+    const t = T0 + 40 * k;
+    const lag = phaseMs ? rnd() * phaseMs : 0;
+    const tau = 40 * k - lag;                    // the instant this position is really from
+    ev.push({ at: t, m: {
+      type: 'state', status: 'play', t,
+      ball: { x: x0 + vx * tau / 1000, y: y0 + vy * tau / 1000, vx, vy },
+      paddles: { a: 225, b: 225 }, score: { a: 0, b: 0 },
+    } });
+  }
+  return ev;
+}
+
+const RALLIES = [[450, 150, 60, 100, 1.5], [-450, -150, 730, 340, 1.4],
+                 [380, -120, 70, 400, 1.6], [-500, 90, 740, 60, 1.3]];
+const smoothness = phaseMs =>
+  RALLIES.flatMap(([vx, vy, x0, y0, s]) => replay(rally(phaseMs, vx, vy, x0, y0, s)).jit);
+
+const honest = smoothness(0);
+const lying = smoothness(20);                // one sim step of wall-clock stamping error
+const hp95 = quant(honest, 0.95), hmax = quant(honest, 1), lp95 = quant(lying, 0.95);
+assert(honest.length > 200, 'the smoothness fixture produced almost no measurable frames: ' + honest.length);
+assert(hp95 < 1, 'the drawn ball is not smooth on a truthful stream: p95 ' + hp95.toFixed(2) + 'px per frame');
+assert(hmax < 3, 'worst frame on a truthful stream: ' + hmax.toFixed(2) + 'px');
+assert(lp95 > 5,
+  'a stream whose positions do not match their own timestamps now renders smoothly (p95 ' +
+  lp95.toFixed(2) + 'px), so this fixture has stopped detecting the bug it exists for');
+
+console.log('predict ok — burst lurch ' + maxStep(real).toFixed(1) + 'ms vs ' +
+  maxStep(ctl).toFixed(1) + 'ms pre-fix; ball jitter p95 ' + hp95.toFixed(2) +
+  'px vs ' + lp95.toFixed(2) + 'px if snapshots mis-stamp by a sim step');
 process.exit(0);

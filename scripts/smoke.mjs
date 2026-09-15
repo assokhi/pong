@@ -19,10 +19,17 @@ const post = async body => {
   return res.json();
 };
 
+// A predicate that throws is a predicate whose subject has not arrived yet — two sockets in one
+// process receive the same broadcast as independent events, so one can be a tick ahead of the
+// other. Retry on it and report it if the wait runs out; do not let it crash the run.
 async function until(fn, what, ms = 8000) {
   const end = Date.now() + ms;
-  while (Date.now() < end) { if (fn()) return; await sleep(50); }
-  assert.fail('timed out waiting for ' + what);
+  let last = null;
+  while (Date.now() < end) {
+    try { if (fn()) return; last = null; } catch (e) { last = e; }
+    await sleep(50);
+  }
+  assert.fail('timed out waiting for ' + what + (last ? ' — predicate kept throwing: ' + last.message : ''));
 }
 
 function open(id, role, token) {
@@ -79,6 +86,24 @@ const spec = await open(id, 'watch');
 assert(spec.welcome.role === null, 'spectator was given a slot');
 await until(() => spec.last && spec.last.spectators === 1, 'spectator count');
 await until(() => ['count', 'play'].includes(a.last.status), 'game to start');
+
+// Beta telemetry: accepted, rate limited, and never trusted enough to reach a log unshaped.
+a.send(JSON.stringify({
+  type: 'telemetry', ms: 15000,
+  net: { rtt: 42, snaps: 370, gapMed: 40, gapP95: 95, gapMax: 'not a number', stalls: -3 },
+  render: { fps: 60, jitMed: 0.1, jitP95: 0.4, jitMax: 1e12 },
+  view: { w: 1920, h: 1080, dpr: 2 },
+  note: 'smoke test note', evil: { nested: 'must not survive' },
+}));
+a.send(JSON.stringify({ type: 'telemetry', ms: 1, note: 'should be rate limited' }));
+await sleep(300);
+assert(a.last.status !== undefined, 'server state corrupted by a telemetry frame');
+
+// /metrics holds players' free-text notes, so with no token configured it must not exist at all.
+const noTok = await fetch(base + '/metrics');
+const badTok = await fetch(base + '/metrics?token=wrong');
+assert(noTok.status === 404 && badTok.status === 404,
+  'GET /metrics answered without a valid token: ' + noTok.status + '/' + badTok.status);
 
 // a spectator has no input path; a player's input moves only their own paddle
 spec.send(JSON.stringify({ type: 'input', y: 60 }));
