@@ -9,16 +9,27 @@ const NEW_ROOM_GRACE = 60e3; // a just-created room has not been reached by its 
 // Defaults for rooms that do not ask for their own; POST /room may override per room.
 const RESERVE = +process.env.PONG_RESERVE_MS || 30e3;
 const EMPTY_TTL = +process.env.PONG_EMPTY_TTL_MS || 600e3;
+const SNAP_MS = +process.env.PONG_SNAP_MS || 40;   // snapshot period; lower it to trade bandwidth for smoothness
+const BEAT_MS = +process.env.PONG_BEAT_MS || 5000; // keepalive period, and how often RTT is resampled
 
 const rooms = new Map();
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 const raw = (ws, s) => { if (ws && ws.readyState === 1) ws.send(s); };
 const send = (ws, o) => raw(ws, JSON.stringify(o));
 
-function makeRoom(reserve = RESERVE, empty = EMPTY_TTL) {
+// mulberry32. Seeded per room so a game is a pure function of (seed, inputs): without that, a run
+// cannot be replayed and a test can only assert vague properties of it.
+const rng = a => () => {
+  a = a + 0x6D2B79F5 | 0;
+  let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+  return ((t ^ t >>> 14) >>> 0) / 4294967296;
+};
+
+function makeRoom(reserve = RESERVE, empty = EMPTY_TTL, seed = crypto.randomBytes(4).readUInt32LE(0)) {
   const r = {
     id: crypto.randomBytes(6).toString('base64url'), // 8 url-safe chars
-    reserve, empty, createdAt: Date.now(), everJoined: false, lag: { a: 0, b: 0 }, lagSent: { a: 0, b: 0 },
+    reserve, empty, seed, rand: rng(seed), createdAt: Date.now(), everJoined: false, lag: { a: 0, b: 0 },
     sock: { a: null, b: null }, tok: { a: null, b: null }, res: { a: 0, b: 0 }, specs: new Set(),
     ball: { x: W / 2, y: H / 2, vx: 0, vy: 0 }, pad: { a: H / 2, b: H / 2 }, tgt: { a: H / 2, b: H / 2 },
     score: { a: 0, b: 0 }, status: 'wait', cd: 0, winner: null, started: false, emptySince: Date.now(),
@@ -29,7 +40,7 @@ function makeRoom(reserve = RESERVE, empty = EMPTY_TTL) {
 
 // dir: +1 serves toward B (right), -1 toward A (left)
 function launch(r, dir) {
-  const th = Math.random() * 0.8 - 0.4;
+  const th = r.rand() * 0.8 - 0.4;
   r.ball = { x: W / 2, y: H / 2, vx: dir * V0 * Math.cos(th), vy: V0 * Math.sin(th) };
   r.status = 'count'; r.cd = 1.5; r.started = true;
 }
@@ -73,7 +84,7 @@ function step(r) {
   const both = r.sock.a && r.sock.b;
   if (r.status !== 'over') {
     if (!both) r.status = r.started ? 'paused' : 'wait';
-    else if (r.status === 'paused' || r.status === 'wait') launch(r, Math.random() < 0.5 ? 1 : -1);
+    else if (r.status === 'paused' || r.status === 'wait') launch(r, r.rand() < 0.5 ? 1 : -1);
   }
   for (const s of ['a', 'b']) {
     const d = clamp(r.tgt[s], PH / 2, H - PH / 2) - r.pad[s];
@@ -104,16 +115,13 @@ function bye(ws, code, reason) {
   setTimeout(() => ws.close(code, reason), 250).unref();
 }
 
-// How old was the world this input was answering? Clients echo the timestamp of the newest
-// snapshot they had, so this is one round trip plus the snapshot's own age. The client needs it
-// to draw the ball where it is now rather than where it was when the packet left.
+// Round trip, timed entirely here: we stamp the ping and read the clock again on the pong, so
+// nothing a client says can influence it. The client needs it to draw the ball where it is now
+// rather than where it was when the packet left. Resampled once per keepalive beat, smoothed
+// because a jumpy value would make the rendered ball jitter — RTT is a slow-moving quantity.
 function measureLag(r, s, ws, ms) {
-  if (!(ms >= 0 && ms < 5000)) return;                     // junk, or a clock from another era
-  const v = clamp(ms, 0, 250);                             // ponytail: client-influenced, so capped
-  r.lag[s] = r.lag[s] ? r.lag[s] * 0.8 + v * 0.2 : v;
-  const now = Date.now();
-  if (now - r.lagSent[s] < 2000) return;
-  r.lagSent[s] = now;
+  if (!(ms >= 0 && ms < 30e3)) return;   // an unsolicited pong (RFC 6455 allows them) times nothing
+  r.lag[s] = r.lag[s] ? r.lag[s] * 0.8 + ms * 0.2 : ms;
   send(ws, { type: 'lag', ms: Math.round(r.lag[s]) });
 }
 
@@ -127,6 +135,14 @@ function seat(r, ws, s) {
 function join(r, ws, role, token) {
   ws.slot = null;
   ws.on('error', () => {});
+  // Keepalive. Without it a client that vanishes without a FIN (lid closed, tunnel dropped, carrier
+  // handover) holds its paddle until the OS TCP timeout — minutes during which the room never
+  // pauses, the opponent farms free points, and the slot never reaches its reservation.
+  ws.isAlive = true; ws.pingAt = 0;
+  ws.on('pong', () => {
+    ws.isAlive = true;
+    if (ws.pingAt && ws.slot && r.sock[ws.slot] === ws) measureLag(r, ws.slot, ws, Date.now() - ws.pingAt);
+  });
   if (role === 'play') {
     const now = Date.now();
     let s = token && ['a', 'b'].find(k => r.tok[k] === token && !r.sock[k]);
@@ -149,7 +165,6 @@ function join(r, ws, role, token) {
     if (m.type === 'input') {
       if (!mine || typeof m.y !== 'number' || !isFinite(m.y)) return;
       r.tgt[ws.slot] = clamp(m.y, PH / 2, H - PH / 2);
-      if (typeof m.ack === 'number') measureLag(r, ws.slot, ws, Date.now() - m.ack);
     } else if (m.type === 'claim') {
       if (mine) return;
       const s = ['a', 'b'].find(k => !r.sock[k] && r.res[k] < Date.now());
@@ -186,9 +201,12 @@ const server = http.createServer((req, res) => {
       const ms = (v, lo, hi, dflt) => (typeof v === 'number' && isFinite(v) ? clamp(v, lo, hi) : dflt);
       // Per-room timings so a test room can exercise the reconnect and sweep paths in seconds.
       // Worst case for an abuser: their own room forgets them faster.
-      const r = makeRoom(ms(o.reserveMs, 500, 60e3, RESERVE), ms(o.emptyMs, 1e3, 600e3, EMPTY_TTL));
+      // A caller-chosen seed makes a room's serves reproducible; it decides nothing but which way
+      // the ball is thrown, so there is nothing to gain by picking one.
+      const seed = typeof o.seed === 'number' && isFinite(o.seed) ? o.seed >>> 0 : undefined;
+      const r = makeRoom(ms(o.reserveMs, 500, 60e3, RESERVE), ms(o.emptyMs, 1e3, 600e3, EMPTY_TTL), seed);
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ id: r.id, reserveMs: r.reserve, emptyMs: r.empty }));
+      res.end(JSON.stringify({ id: r.id, reserveMs: r.reserve, emptyMs: r.empty, seed: r.seed }));
     });
     return;
   }
@@ -199,7 +217,9 @@ const server = http.createServer((req, res) => {
   res.writeHead(404).end('not found');
 });
 
-const wss = new WebSocketServer({ noServer: true });
+// maxPayload: the largest thing a client legitimately sends is a ~50 byte input frame. The default
+// cap is 100 MiB, which is a free memory spike for anyone who asks.
+const wss = new WebSocketServer({ noServer: true, maxPayload: 4096 });
 server.on('upgrade', (req, sock, head) => {
   const u = new URL(req.url, 'http://x');
   const r = rooms.get(u.searchParams.get('room') || '');
@@ -215,7 +235,18 @@ const simTimer = setInterval(() => {
   acc = Math.min(acc + (now - last) / 1000, 0.25); last = now;
   while (acc >= DT) { acc -= DT; for (const r of rooms.values()) step(r); }
 }, 4);
-const castTimer = setInterval(broadcast, 40); // 25 Hz snapshots
+const castTimer = setInterval(broadcast, SNAP_MS); // 25 Hz snapshots by default
+
+// A socket that misses a whole beat is gone. terminate() fires 'close', so the slot release and
+// reservation below need no special case. Browsers answer ping frames in the protocol layer, so
+// this costs the client nothing to implement.
+const beatTimer = setInterval(() => {
+  const now = Date.now();
+  for (const ws of wss.clients) {
+    if (!ws.isAlive) { ws.terminate(); continue; }
+    ws.isAlive = false; ws.pingAt = now; ws.ping();
+  }
+}, BEAT_MS);
 
 const sweepTimer = setInterval(() => { // TTL sweep
   const now = Date.now();
@@ -236,7 +267,7 @@ const sweepTimer = setInterval(() => { // TTL sweep
 // Render sends SIGTERM before replacing the instance. Rooms are in memory, so every game in
 // progress is lost either way — 4004 just makes that legible instead of a generic disconnect.
 process.on('SIGTERM', () => {
-  clearInterval(simTimer); clearInterval(castTimer); clearInterval(sweepTimer);
+  clearInterval(simTimer); clearInterval(castTimer); clearInterval(sweepTimer); clearInterval(beatTimer);
   for (const ws of wss.clients) bye(ws, 4004, 'server restarting');
   rooms.clear();
   server.close(() => process.exit(0));
@@ -265,6 +296,29 @@ if (process.argv[2] === '--selftest') {
   sim(r, DT);
   assert(r.score.b === 1 && r.status === 'count' && r.ball.vx > 0, 'bad score/serve: ' + JSON.stringify(r.score));
   rooms.delete(r.id);
+
+  // Fairness. A rally speeds up on every hit, and once the ball outruns the paddle the game stops
+  // being a contest of skill and becomes a coin flip on which half the serve lands in. The invariant
+  // is that a paddle can still cross the field in the time the fastest possible shot takes to arrive.
+  const travel = PSPEED * ((BX - AX - PW) / VMAX);
+  assert(travel >= H - PH,
+    'top-speed shots are no longer reachable: ' + travel.toFixed(0) + 'px of paddle travel for ' +
+    (H - PH) + 'px of field. Lower VMAX or raise PSPEED.');
+
+  // Determinism. Same seed, same steps, same world. This is what lets an impaired run be compared
+  // against anything at all; without it a network test can only assert vague properties.
+  const d1 = makeRoom(RESERVE, EMPTY_TTL, 12345), d2 = makeRoom(RESERVE, EMPTY_TTL, 12345);
+  for (const d of [d1, d2]) { launch(d, 1); d.status = 'play'; }
+  const firstServe = { ...d1.ball };
+  for (let i = 0; i < 900; i++) { sim(d1, DT); sim(d2, DT); }   // 15 s of play, several serves deep
+  assert(d1.score.a + d1.score.b > 0, 'the determinism fixture never scored, so it never re-served');
+  assert.deepStrictEqual(d1.ball, d2.ball, 'same seed diverged: ' + JSON.stringify([d1.ball, d2.ball]));
+  assert.deepStrictEqual(d1.score, d2.score, 'same seed scored differently');
+  const d3 = makeRoom(RESERVE, EMPTY_TTL, 999);
+  launch(d3, 1);
+  assert(d3.ball.vy !== firstServe.vy, 'a different seed served at an identical angle');
+  rooms.delete(d1.id); rooms.delete(d2.id); rooms.delete(d3.id);
+
   console.log('selftest ok'); process.exit(0); // sim timers are already running, so exit explicitly
 } else {
   server.listen(PORT, () => console.log('pong on http://localhost:' + PORT));

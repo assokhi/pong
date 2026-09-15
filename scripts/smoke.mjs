@@ -62,6 +62,13 @@ assert(clamped.reserveMs === 500 && clamped.emptyMs === 1000, 'out-of-range timi
 const page = await fetch(base + '/r/' + id);
 assert(page.status === 200 && (await page.text()).includes('<canvas'), 'client html not served');
 
+// Keepalive fixture, opened here so its 35 s of idling overlaps the rest of the suite rather than
+// adding to it. Asserted at the very end.
+const idleRoom = await post({ emptyMs: 600e3 });
+const idleAt = Date.now();
+const idle = await open(idleRoom.id, 'watch');
+assert(idle.welcome, 'could not open the keepalive fixture');
+
 const a = await open(id, 'play'), b = await open(id, 'play');
 assert(a.welcome.role === 'a' && b.welcome.role === 'b', 'slot assignment: ' + a.welcome.role + '/' + b.welcome.role);
 
@@ -141,6 +148,22 @@ assert(late.welcome, 'a room was swept before anyone could connect to it');
 const rejoin = await open(kept.id, 'watch');
 assert(rejoin.welcome, 'a spectator-only room was swept before its no-player TTL');
 late.close(); rejoin.close(); keptSpec.close();
+
+// The server pings every beat and terminates any socket that misses a pong. Ping and pong are
+// protocol-level frames, so anything sitting between the app and the player has to forward them —
+// and a proxy that swallows them instead turns that keepalive into a machine that kills healthy
+// connections on a timer. Nothing local can tell us whether the real edge forwards them; only the
+// live run can, which is why this assertion exists here and not in a unit test.
+const held = 35e3 - (Date.now() - idleAt);
+if (held > 0) await sleep(held);
+assert(!idle.closed && !idle.bye,
+  'an idle connection was dropped within 35s: ' + JSON.stringify(idle.bye || idle.closed) +
+  ' — if this is a 1006 with no reason, a proxy is eating ping/pong frames');
+const before = idle.last && idle.last.t;
+assert(before, 'the idle connection never received a snapshot');
+await sleep(500);
+assert(idle.last.t > before, 'an idle connection went quiet without closing');
+idle.close();
 
 console.log('smoke ok against ' + base);
 process.exit(0);

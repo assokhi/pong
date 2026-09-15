@@ -21,16 +21,80 @@
 const cv = document.getElementById('c'), ctx = cv.getContext('2d'), uiEl = document.getElementById('ui');
 const noteEl = document.getElementById('note');
 const roomId = location.pathname.startsWith('/r/') ? location.pathname.slice(3) : '';
+/*<net>*/
+// ponytail: fenced so scripts/predict.test.mjs can lift this block out and run it under node:vm.
+// Nothing in here may touch the DOM or the network. Upgrade path if the fence ever chafes: make
+// it a served module and import it.
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 const lerp = (a, b, u) => a + (b - a) * u;
 const V = { W: 800, H: 450, R: 7, PW: 12, PH: 80, AX: 24, BX: 764, SPEED: 700, WIN: 11 };
-const BUFFER = 100; // ms of interpolation delay
+let BUFFER = 100;                  // ms of interpolation delay
+let buf = [], off = null, rttMs = 0;
+let sA = null, sB = null, su = 0;  // interpolation pair, kept out of the render loop to avoid allocation
+let ballX = 0, ballY = 0;          // likewise: ballAt() writes here rather than returning a point
 
-let ws = null, role = null, chosen = false, buf = [], myY = V.H / 2, tgt = V.H / 2, sentY = null, sentAt = 0;
+// Snapshots play back on the SERVER's clock, never on arrival time. A lost segment stalls every
+// snapshot queued behind it — this is TCP, so nothing is dropped, it is delayed — and then five
+// arrive in the same millisecond. Keyed off arrival, that burst gave five frames near-identical
+// timestamps, sample() walked back to the oldest frame still buffered, and the opponent's paddle
+// lurched backwards a third of a second before fast-forwarding through the whole burst. m.t is
+// 40 ms apart however the bytes actually turned up.
+//
+// off is min-filtered because the least-delayed sample seen so far is the best estimate of the
+// true offset; the slow upward drift allowance lets it follow real clock skew without chasing
+// jitter back up.
+function trackClock(serverT, localNow) {
+  const o = localNow - serverT;
+  off = off === null ? o : Math.min(o, off + 0.05);   // ~1.25 ms/s of drift tolerance at 25 Hz
+}
+
+function pushSnap(m, localNow) {
+  trackClock(m.t, localNow);
+  buf.push(m);
+  if (buf.length > 12) buf.shift();
+}
+
+function sample(now) {
+  const rt = now - BUFFER;
+  let i = buf.length - 1;
+  while (i > 0 && buf[i].t + off > rt) i--;
+  sA = buf[i]; sB = buf[i + 1] || buf[i];
+  su = buf[i + 1] ? clamp((rt - (buf[i].t + off)) / (buf[i + 1].t - buf[i].t || 1), 0, 1) : 0;
+}
+
+// Paddles are interpolated from the past, but the ball must not be: between bounces it flies in a
+// straight line, so where it is *now* follows exactly from the newest snapshot. Drawing it in the
+// past let the server award points while the ball still looked a tenth of the field short of the
+// paddle — the player saw a shot they could still reach, and lost it anyway.
+//
+// off already absorbs the baseline one-way delay, so rttMs/2 is what remains to carry the ball
+// from "when this snapshot would have arrived" to "where it is now". The two terms are
+// complementary, not two spellings of the same correction.
+function ballAt(s, now) {
+  ballX = s.ball.x; ballY = s.ball.y;
+  if (s.status !== 'play') return;
+  const age = Math.min((now - (s.t + off) + rttMs / 2) / 1000, 0.25);
+  ballX += s.ball.vx * age;
+  ballY += s.ball.vy * age;
+  if (ballY < V.R) ballY = 2 * V.R - ballY;                       // walls bounce predictably
+  else if (ballY > V.H - V.R) ballY = 2 * (V.H - V.R) - ballY;
+  // Contact is the server's call, so never run the ball past a paddle ahead of the verdict.
+  const fa = V.AX + V.PW + V.R, fb = V.BX - V.R;
+  if (s.ball.x >= fa && ballX < fa) ballX = fa;
+  if (s.ball.x <= fb && ballX > fb) ballX = fb;
+}
+/*</net>*/
+
+// Hand-testing knobs: ?buffer=250 widens the jitter cushion, ?rtt=200 pins the extrapolation
+// distance so you can see what a given latency looks like without actually having it.
+const qs = new URLSearchParams(location.search);
+let rttPin = false;
+if (qs.has('buffer')) BUFFER = Math.max(0, +qs.get('buffer') || 0);
+if (qs.has('rtt')) { rttMs = Math.max(0, +qs.get('rtt') || 0); rttPin = true; }
+
+let ws = null, role = null, chosen = false, myY = V.H / 2, tgt = V.H / 2, sentY = null, sentAt = 0;
 let lastTgt = null, tgtAt = 0; // when the player last asked the paddle to go somewhere new
-let ackT = 0, rttMs = 0;      // newest snapshot's server time, and the round trip the server measured
 let scale = 1, ox = 0, oy = 0, dpr = 1, uiKey = null;
-let sA = null, sB = null, su = 0; // interpolation pair, kept out of the render loop to avoid allocation
 let sScore = '0  0', sSpec = 'spectators 0', roleLabel = 'watching', lastScore = -1, lastSpec = -1;
 const CD = ['', '1', '2'];
 const TAU = Math.PI * 2;
@@ -87,12 +151,10 @@ function connect(r, token) {
       if (uiKey === 'gone') { uiKey = null; uiEl.innerHTML = ''; } // clear "reconnecting…"
     }
     else if (m.type === 'role') { setRole(m.role, m.token); note('you are now player ' + m.role.toUpperCase()); }
-    else if (m.type === 'lag') rttMs = m.ms;
+    else if (m.type === 'lag') { if (!rttPin) rttMs = m.ms; }
     else if (m.type === 'bye') { farewell = m; sock.close(); }
     else if (m.type === 'state') {
-      ackT = m.t;
-      buf.push({ t: performance.now(), s: m });
-      if (buf.length > 12) buf.shift();
+      pushSnap(m, performance.now());
       if (role) reconcile(m.paddles[role]);
       ui(m);
     }
@@ -139,7 +201,7 @@ function setRole(r, token) {
   role = r;
   roleLabel = r ? 'you: player ' + r.toUpperCase() : 'watching';
   if (token) sessionStorage.setItem('tok:' + roomId, token);
-  if (r && buf.length) myY = tgt = buf[buf.length - 1].s.paddles[r];
+  if (r && buf.length) myY = tgt = buf[buf.length - 1].paddles[r];
   sentY = null; uiKey = null;
 }
 
@@ -193,14 +255,6 @@ function resize() {
 resize();
 
 /* ---------- render ---------- */
-function sample(now) {
-  const rt = now - BUFFER;
-  let i = buf.length - 1;
-  while (i > 0 && buf[i].t > rt) i--;
-  sA = buf[i].s; sB = buf[i + 1] ? buf[i + 1].s : buf[i].s;
-  su = buf[i + 1] ? clamp((rt - buf[i].t) / (buf[i + 1].t - buf[i].t || 1), 0, 1) : 0;
-}
-
 let prev = performance.now();
 function frame(now) {
   requestAnimationFrame(frame);
@@ -212,7 +266,7 @@ function frame(now) {
     if (tgt !== lastTgt) { lastTgt = tgt; tgtAt = now; } // mouse, touch and keys all land here
     myY += clamp(tgt - myY, -V.SPEED * dt, V.SPEED * dt);
     if (tgt !== sentY && now - sentAt >= 16 && ws.readyState === 1) { // capped at ~60 msg/s
-      ws.send('{"type":"input","y":' + tgt.toFixed(1) + ',"ack":' + ackT + '}');
+      ws.send('{"type":"input","y":' + tgt.toFixed(1) + '}');
       sentY = tgt; sentAt = now;
     }
   }
@@ -221,7 +275,7 @@ function frame(now) {
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, cv.width, cv.height);
   if (!buf.length) return;
   sample(now);
-  const s = buf[buf.length - 1].s;
+  const s = buf[buf.length - 1];
 
   ctx.setTransform(scale, 0, 0, scale, ox, oy);
   ctx.fillStyle = '#222';
@@ -230,24 +284,9 @@ function frame(now) {
   ctx.fillRect(V.AX, (role === 'a' ? myY : lerp(sA.paddles.a, sB.paddles.a, su)) - V.PH / 2, V.PW, V.PH);
   ctx.fillRect(V.BX, (role === 'b' ? myY : lerp(sA.paddles.b, sB.paddles.b, su)) - V.PH / 2, V.PW, V.PH);
   if (s.status !== 'over') {
-    // Paddles are interpolated from the past, but the ball must not be: between bounces it flies
-    // in a straight line, so where it is *now* follows exactly from the newest snapshot. Drawing
-    // it in the past let the server award points while the ball still looked a tenth of the field
-    // short of the paddle — the player saw a shot they could still reach, and lost it anyway.
-    let bx = s.ball.x, by = s.ball.y;
-    if (s.status === 'play') {
-      const age = Math.min((now - buf[buf.length - 1].t + rttMs / 2) / 1000, 0.25);
-      bx += s.ball.vx * age;
-      by += s.ball.vy * age;
-      if (by < V.R) by = 2 * V.R - by;                        // walls bounce predictably
-      else if (by > V.H - V.R) by = 2 * (V.H - V.R) - by;
-      // Contact is the server's call, so never run the ball past a paddle ahead of the verdict.
-      const fa = V.AX + V.PW + V.R, fb = V.BX - V.R;
-      if (s.ball.x >= fa && bx < fa) bx = fa;
-      if (s.ball.x <= fb && bx > fb) bx = fb;
-    }
+    ballAt(s, now);
     ctx.beginPath();
-    ctx.arc(bx, by, V.R, 0, TAU);   // R is the server's collision radius, so this is the real shape
+    ctx.arc(ballX, ballY, V.R, 0, TAU); // R is the server's collision radius, so this is the real shape
     ctx.fill();
   }
 

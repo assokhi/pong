@@ -43,6 +43,9 @@ flowchart LR
 | [server.js](server.js) | HTTP, WebSocket, room registry, simulation, and the `--selftest` physics check |
 | [client.html](client.html) | the entire client: canvas renderer, input, prediction, reconnect |
 | [scripts/smoke.mjs](scripts/smoke.mjs) | end-to-end check against a running server |
+| [scripts/predict.test.mjs](scripts/predict.test.mjs) | the client's net math, lifted out of `client.html` and run under `node:vm` |
+| [scripts/netshape.mjs](scripts/netshape.mjs) | TCP impairment proxy: latency, jitter, and the stalls that loss really causes |
+| [scripts/impaired.mjs](scripts/impaired.mjs) | a real game played through that proxy, asserted on two clocks at once |
 | [render.yaml](render.yaml) · [deploy.yml](.github/workflows/deploy.yml) | host definition and the deploy-with-rollback pipeline |
 
 ## Run it
@@ -50,9 +53,23 @@ flowchart LR
 ```
 npm install          # one dependency: ws
 npm start            # http://localhost:8080   (PORT=... to change)
-npm test             # physics self-check: tunneling, angle reflection, walls, scoring
+npm test             # physics: tunneling, angle reflection, walls, scoring, fairness, determinism
+npm run test:predict # the client's interpolation and extrapolation, lifted out of client.html
+npm run test:impaired# a real game over a link with 150 ms latency, jitter and 3% loss
 npm run smoke        # end-to-end against a running server (pass a base URL to target another host)
 ```
+
+To play over a bad link by hand, put the impairment proxy in front of the server
+and use its port instead:
+
+```
+npm start &
+DELAY_MS=150 JITTER_MS=50 LOSS=0.03 npm run netshape   # then play on :9080, not :8080
+```
+
+`?buffer=250` and `?rtt=200` on a room URL pin the interpolation delay and the
+extrapolation distance, so you can see what a given latency looks like without
+having it.
 
 `npm run smoke` needs no environment setup and no waiting: it asks `POST /room`
 for its own short reconnect and sweep windows, so every assertion — including
@@ -116,6 +133,14 @@ sequenceDiagram
   Note over S: both paddles filled, count, play
 ```
 
+- Every socket is pinged every 5 s and terminated if it misses a whole beat.
+  A client that disappears without closing — lid shut, tunnel dropped, carrier
+  handover — is otherwise still holding its paddle when the OS gives up on the
+  TCP connection *minutes* later, and for that whole window the room never
+  pauses, the opponent farms free points into an empty net, and the slot never
+  reaches the reservation that would let a spectator take it. Ping and pong are
+  protocol-level frames, so the browser answers them with no client code; the
+  same pong is what times the round trip.
 - Rooms are in-memory, swept every 5 s: dropped once everyone who was in them has
   left, or after 10 minutes with no player in either slot. A room with spectators
   but no player survives until that second timeout.
@@ -132,7 +157,7 @@ sequenceDiagram
 
 | Method | Path | Response |
 | --- | --- | --- |
-| `POST` | `/room` | `{id, reserveMs, emptyMs}`, room created. Optional JSON body `{reserveMs, emptyMs}` overrides that room's disconnect reservation (500 ms – 60 s) and no-player TTL (1 s – 10 min); out-of-range and junk values fall back to the defaults, and the body is capped at 1 KB. The response echoes the values actually used |
+| `POST` | `/room` | `{id, reserveMs, emptyMs, seed}`, room created. Optional JSON body `{reserveMs, emptyMs, seed}` overrides that room's disconnect reservation (500 ms – 60 s), its no-player TTL (1 s – 10 min), and the serve PRNG seed; out-of-range and junk values fall back to the defaults, and the body is capped at 1 KB. The response echoes the values actually used. A seed decides nothing but which way the ball is thrown, so there is nothing to gain by choosing one — it exists so a test can replay a game exactly |
 | `GET` | `/health` | `{ok, version, rooms, uptime}` — `version` is `RENDER_GIT_COMMIT` or `dev`. CI polls it to confirm the new process is serving traffic before smoke-testing it |
 | `GET` | `/` | landing page (create / join by id) |
 | `GET` | `/r/:id` | the same `client.html` |
@@ -146,7 +171,7 @@ All frames are JSON with a `type` field.
 
 | type | payload | who may send | server behaviour |
 | --- | --- | --- | --- |
-| `input` | `{y: number, ack?: number}` — target paddle y in virtual units, and the `t` of the newest snapshot this client had | player A or B only | `y` is clamped to `[40, 410]` and **ignored** unless the room's own record says this socket holds that slot. A claimed role in a message is never trusted. `ack` feeds the lag estimate. Send at ≤ 60/s. |
+| `input` | `{y: number}` — target paddle y in virtual units | player A or B only | `y` is clamped to `[40, 410]` and **ignored** unless the room's own record says this socket holds that slot. A claimed role in a message is never trusted. Send at ≤ 60/s. |
 | `claim` | `{}` | any socket without a slot | seats it in a free, unreserved slot and replies with `role`; ignored if no slot is claimable |
 | `rematch` | `{}` | player A or B only | only while `status === "over"`: resets the score, keeps the room and its spectators |
 
@@ -159,7 +184,7 @@ Malformed JSON, unknown types, and non-finite `y` are dropped silently.
 | `welcome` | `{room, role: "a"\|"b"\|null, token: string\|null, dims:{W,H,R,PW,PH,AX,BX,SPEED,WIN}}` | once on connect. `role: null` means spectator; `token` reclaims the slot within the 30 s reservation |
 | `state` | `{ball:{x,y,vx,vy}, paddles:{a,b}, score:{a,b}, spectators:int, open:bool, status, cd, winner, t}` | everyone in the room, 25 Hz, serialized once per room per tick |
 | `role` | `{role:"a"\|"b", token}` | the socket whose `claim` succeeded; it switches to player mode |
-| `lag` | `{ms}` — smoothed round trip plus snapshot age, capped at 250 ms | a player, at most every 2 s, in reply to an `input` carrying `ack` |
+| `lag` | `{ms}` — smoothed round trip, measured server-side | a player, once per keepalive beat, in reply to its `pong` |
 | `bye` | `{code, reason}` | any socket the server is about to close, sent ~250 ms before the close frame. Proxies (Render's included) may swallow a close frame and leave the peer with a bare `1006` and no reason, so the reason travels as ordinary data and the close code is only a fallback. Clients and the smoke test key off this message |
 
 `status` is one of `wait` (no second player yet), `count` (serving, `cd` seconds
@@ -189,7 +214,7 @@ the same moment in time.
 
 ```mermaid
 flowchart TD
-  W["state, 25/s"] --> BUF["12-deep snapshot buffer"]
+  W["state, 25/s"] --> BUF["12-deep snapshot buffer<br/>keyed on the server's t, not on arrival"]
 
   BUF --> PAIR["the two snapshots bracketing now minus 100 ms"]
   PAIR --> OPP["opponent paddle<br/>interpolated between them"]
@@ -208,6 +233,24 @@ flowchart TD
 snapshots that bracket that moment, which is what keeps an opponent's motion
 smooth across a lossy link.
 
+**That 100 ms is measured on the server's clock, never on arrival time**, and on
+a bad link the difference is the whole ball game. This is TCP: a lost segment is
+not a gap, it is a stall, because every byte queued behind it waits for the
+retransmit. Then the backlog lands at once. Keyed on arrival, a burst of five
+snapshots got five near-identical timestamps, the search for the bracketing pair
+walked back to the oldest frame still buffered, and the opponent's paddle lurched
+*backwards* a sixth of a second before fast-forwarding through the burst —
+measurably 164 ms of lurch against 10 ms once the same fixture is played on `t`
+(`scripts/predict.test.mjs`, which keeps the old algorithm as a control so the
+fixture cannot quietly stop proving anything). Snapshots are 40 ms apart on `t`
+however the bytes actually turn up, so the burst plays out at its real speed and
+the buffer absorbs the stall.
+
+Client and server clocks are related by an offset that is min-filtered: the
+least-delayed sample seen so far is the best estimate of the true offset, and a
+slow upward drift allowance lets it follow real clock skew without chasing jitter
+back up.
+
 **The ball does not.** Between bounces it travels in a straight line, so where it
 is *now* follows exactly from the newest snapshot. Drawing it in the past let the
 server award a point while the ball still looked a tenth of the field short of
@@ -218,12 +261,21 @@ are predictable. Contact with a paddle is not predictable and is the server's
 call, so the extrapolated ball is never carried past a paddle face the server has
 not yet ruled on.
 
-That offset has to be measured. Each `input` echoes the `t` of the newest
-snapshot the client had; the server subtracts it from its own clock, smooths the
-result and caps it at 250 ms — the number is client-influenced, so it is bounded
-— and sends it back as `lag` at most twice a second. A spectator sends no input
-and so has no measured round trip; it advances the ball by the snapshot's age
-alone.
+The round trip has to be measured, and it is measured entirely server-side: the
+keepalive ping is stamped on the way out, the clock is read again when the `pong`
+comes back, and the smoothed result goes to the player as `lag`. Nothing a client
+says enters it. It is smoothed because a jumpy value would make the rendered ball
+jitter, and RTT is a slow-moving quantity anyway. A spectator gets a `lag` of
+zero and advances the ball by the snapshot's age alone.
+
+Note what this does *not* buy. Because every snapshot carries `vx, vy`, any
+client can already integrate the ball's whole path to its own paddle plane
+without asking the server anything, so a modified client that inflates its own
+extrapolation is not being stopped by this number — it was never being stopped.
+The only real counter is to stop shipping velocity, which costs exactly the
+reachability the extrapolation was added to restore. In a link-shared game with
+no ranking, that is the wrong trade; server-side measurement is here because it
+is simpler and has no junk-input surface, not because it is a defence.
 
 **A player's own paddle is predicted locally and never corrected mid-motion.** A
 snapshot describes the paddle as it was a round trip ago, so while the player is
@@ -252,6 +304,55 @@ server is restarting and enables its button after 8 s, since the replacement
 instance needs time to boot. Which case it is comes from the `bye` message when
 there is one, falling back to the close code, so a proxy that eats close frames
 cannot turn a deliberate refusal into a retry loop.
+
+## Testing
+
+Five layers, each asserting the thing it is actually able to observe. The split
+matters more than the count: put a claim in the wrong layer and you get a test
+that is either flaky or vacuous.
+
+| Layer | Command | What only it can prove |
+| --- | --- | --- |
+| Physics | `npm test` | Exact, in-process, no timers: tunneling, reflection, walls, scoring, the fairness invariant, and identical replay from a seed |
+| Client net math | `npm run test:predict` | Interpolation, clock tracking and ball extrapolation, against hand-built burst and stall fixtures no live run can reproduce on demand |
+| Degraded network | `npm run test:impaired` | That a real game survives real latency, jitter and loss — and that the server's timeline does not move when a client's link does |
+| End to end | `npm run smoke` | The whole protocol over real sockets: slots, spectators, tokens, reservations, sweeps, keepalive |
+| Deploy | CI, on push | That the process now serving traffic is this commit, and that it still passes the end-to-end suite in production |
+
+Three of those deserve a note.
+
+**Determinism is asserted in-process, not across two live runs.** The obvious
+system test — run one seeded game clean, one impaired, assert the same final
+score — does not work, and the reason is worth knowing. The sim steps at 60 Hz
+off an accumulator while `broadcast()` samples it at 25 Hz off a separate timer,
+and the phase between those two timers is set by process start. Two runs sample
+the same deterministic world at different tick offsets, so their snapshot streams
+differ even with an identical seed and no input at all. The determinism is real;
+it is just only exactly observable where there are no timers in the way.
+
+**What the impaired run asserts instead is better.** Every snapshot carries `t`,
+stamped server-side at broadcast, so one stream can be watched on two clocks at
+once: `t` says when the server produced a frame, arrival says when this client
+got it. Under 150 ms ± 50 ms with 3% loss those diverge hard — arrivals burst to
+~280 ms against a ~35 ms median while `t` holds a ~47 ms cadence indistinguishable
+from the clean baseline. That gap *is* the claim the architecture rests on: how
+bad one client's link is never reaches the simulation.
+
+**Absolute timings are a property of the host, not of this code.** Node's timers
+quantise to the platform clock — a 40 ms interval really lands near 47 ms on
+Windows — so the impaired run compares itself against a clean baseline measured
+on the same machine rather than against a number someone wrote down.
+
+The impairment proxy models the one thing that matters above TCP, and it is not
+packet loss. **Nothing is ever lost above TCP.** A dropped segment is
+retransmitted; what the application sees is a stall, because every byte queued
+behind it waits too, and then the backlog arrives at once. So `netshape.mjs`
+delays a byte stream through a single FIFO queue in which a delayed chunk can
+never be overtaken. That queue is load-bearing: an earlier version gave each
+chunk its own `setTimeout`, two chunks clamped to the same release instant got
+different *delay* values, landed in different timer buckets and fired out of
+order — and a proxy that reorders bytes is not a bad network, it is a corrupt
+one. It showed up as a torn HTTP handshake, which is at least an honest failure.
 
 ## Deployment
 
