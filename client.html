@@ -37,6 +37,53 @@ const TAU = Math.PI * 2;
 
 function note(t) { noteEl.textContent = t; clearTimeout(note.t); note.t = setTimeout(() => noteEl.textContent = '', 4000); }
 
+<<<<<<< Updated upstream
+=======
+/* ---------- beta telemetry ---------- */
+// What a player means by "the ball is jittery" is not a feeling the logs can hold, so the client
+// measures it: jitMed/jitP95/jitMax are how far the drawn ball departed from velocity x frame time
+// in free flight, in virtual px. On a correct stream that is ~0 whatever the network is doing, so a
+// non-zero value is a real defect and the network numbers beside it say which one.
+const CAP = 3000;                       // bound the sample arrays if a send ever fails to fire
+let tele = null;
+function resetTele() {
+  // Every field describes this window and only this window, so a run of reports sums to the
+  // session. A counter that carried over would read as a spike in whichever window happened to
+  // send after it.
+  tele = { t0: performance.now(), snaps: 0, reconnects: 0, gaps: [], jit: [],
+           frames: 0, underruns: 0, clamped: 0, stalls: 0, ageMax: 0, lastAt: 0 };
+}
+resetTele();
+
+const quant = (a, p) => {
+  if (!a.length) return 0;
+  const s = [...a].sort((x, y) => x - y);
+  return +s[Math.min(s.length - 1, Math.floor(s.length * p))].toFixed(2);
+};
+
+function sendTele(text) {
+  if (!ws || ws.readyState !== 1) return;
+  const ms = Math.max(1, performance.now() - tele.t0);
+  ws.send(JSON.stringify({
+    type: 'telemetry',
+    ms: Math.round(ms),
+    net: {
+      rtt: Math.round(rttMs), snaps: tele.snaps, reconnects: tele.reconnects, stalls: tele.stalls,
+      gapMed: quant(tele.gaps, 0.5), gapP95: quant(tele.gaps, 0.95), gapMax: quant(tele.gaps, 1),
+    },
+    render: {
+      fps: Math.round(tele.frames / (ms / 1000)), samples: tele.jit.length,
+      jitMed: quant(tele.jit, 0.5), jitP95: quant(tele.jit, 0.95), jitMax: quant(tele.jit, 1),
+      underruns: tele.underruns, clamped: tele.clamped, ageMax: Math.round(tele.ageMax * 1000),
+    },
+    view: { w: innerWidth, h: innerHeight, dpr: +dpr.toFixed(2) },
+    note: text || undefined,
+  }));
+  resetTele();
+}
+setInterval(() => { if (tele.frames) sendTele(); }, 15000);
+
+>>>>>>> Stashed changes
 /* ---------- landing ---------- */
 if (!roomId) {
   uiEl.innerHTML = '<div class=box><b>PONG</b><br><button id=mk>Create room</button><br>' +
