@@ -124,13 +124,16 @@ const bad = await room(4242);
 const a = await watch(PROXY, bad.id, 'play'), b = await watch(PROXY, bad.id, 'play');
 assert(a.welcome.role === 'a' && b.welcome.role === 'b', 'slots through the proxy: ' + a.welcome.role);
 
-// Play it: track the ball, the way a player would, so the input path is under load throughout.
+// Play it. A tracks the ball the way a player would, so the input path stays under load; B parks
+// at the bottom of its range and mostly misses. Both clients tracking produces an endless rally,
+// and a rally that never ends scores nothing — which is how "somebody scored within 8s" became an
+// assertion about how badly the test clients play rather than about the game or the network.
 const drive = setInterval(() => {
   if (!a.last) return;
   a.send(JSON.stringify({ type: 'input', y: a.last.ball.y }));
-  b.send(JSON.stringify({ type: 'input', y: a.last.ball.y }));
+  b.send(JSON.stringify({ type: 'input', y: 410 }));
 }, 50);
-await sleep(8000);
+await sleep(11000);
 clearInterval(drive);
 
 // Then a deterministic probe: park the paddle somewhere specific and see if it gets there. Whether
@@ -195,7 +198,18 @@ assert(a.lag < 4 * (DELAY + JITTER) + 400, 'RTT is implausible: ' + a.lag + 'ms'
 
 // 4. The game ran and input survived the link.
 assert(['count', 'play', 'over'].includes(a.last.status), 'the game never got going: ' + a.last.status);
-assert(a.last.score.a + a.last.score.b > 0, 'nobody scored in 8s of impaired play');
+// Rallies are happening: the ball keeps crossing the middle. That is what "the game is live"
+// means here, and unlike a score it does not depend on a paddle missing.
+let crossings = 0, side = 0;
+for (const e of a.events) {
+  if (e.m.type !== 'state' || e.m.status !== 'play') continue;
+  const half = Math.sign(e.m.ball.x - 400);
+  if (half && side && half !== side) crossings++;
+  if (half) side = half;
+}
+assert(crossings >= 2, `the ball crossed the middle only ${crossings} time(s) in 11s of play`);
+assert(a.last.score.a + a.last.score.b > 0,
+  'no point scored in 11s even with B parked out of the way: ' + JSON.stringify(a.last.score));
 assert(Math.abs(a.last.paddles.a - TARGET_Y) < 5,
   `input did not survive the link: paddle sat at ${a.last.paddles.a.toFixed(1)}, asked for ${TARGET_Y}`);
 
@@ -232,6 +246,7 @@ assert(typeof rec.ua === 'string', 'the user agent was not attached from the req
 console.log(`  telemetry ok — ${reports.length} report(s) via /metrics, unknown keys dropped, ` +
   `note truncated to ${rec.note.length}`);
 console.log(`impaired ok — ${DELAY}+/-${JITTER}ms, ${LOSS * 100}% loss: arrivals burst to ` +
-  `${arrival.max}ms, ball jitter p95 ${jp95.toFixed(2)}px, server cadence ${server.med}ms`);
+  `${arrival.max}ms, ball jitter p95 ${jp95.toFixed(2)}px, server cadence ${server.med}ms, ` +
+  `${crossings} rally crossings`);
 stop();
 process.exit(0);
