@@ -41,7 +41,8 @@ flowchart LR
 | file | what is in it |
 | --- | --- |
 | [server.js](server.js) | HTTP, WebSocket, room registry, simulation, and the `--selftest` physics check |
-| [client.html](client.html) | the entire client: canvas renderer, input, prediction, reconnect |
+| [client.html](client.html) | the entire client: WebGL2 renderer, DOM HUD, input, prediction, reconnect |
+| [scripts/checkclient.mjs](scripts/checkclient.mjs) | parses the page and reads the shader as pedantically as a compiler would, since CI has no GPU |
 | [scripts/smoke.mjs](scripts/smoke.mjs) | end-to-end check against a running server |
 | [scripts/netmath.mjs](scripts/netmath.mjs) | lifts the client's net math out of `client.html` so tests drive the shipped code, and replays a captured session through it |
 | [scripts/predict.test.mjs](scripts/predict.test.mjs) | interpolation, clock slew and ball smoothness against built fixtures |
@@ -54,6 +55,7 @@ flowchart LR
 ```
 npm install          # one dependency: ws
 npm start            # http://localhost:8080   (PORT=... to change)
+npm run check:client # client.html parses, its ids exist, its shader is well formed
 npm test             # physics: tunneling, angle reflection, walls, scoring, fairness, determinism
 npm run test:predict # the client's interpolation and extrapolation, lifted out of client.html
 npm run test:impaired# a real game over a link with 150 ms latency, jitter and 3% loss
@@ -220,7 +222,7 @@ depend on the close code alone: a proxy that drops the close frame turns every o
 of them into `1006`, and a client reading only the code would treat "room full" as
 a network blip and retry in a loop.
 
-## Client rendering
+## What is drawn when
 
 Nothing is drawn from a raw snapshot position, and not everything is drawn from
 the same moment in time.
@@ -336,6 +338,46 @@ instance needs time to boot. Which case it is comes from the `bye` message when
 there is one, falling back to the close code, so a proxy that eats close frames
 cannot turn a deliberate refusal into a retry loop.
 
+## Graphics
+
+The playfield is WebGL2: one fullscreen triangle, and every shape in it a signed distance field
+evaluated in the fragment shader. Not for throughput — the 2D path it replaced issued about
+twenty-three draw calls a frame into a GPU-accelerated context and was never anywhere near being
+the bottleneck. It is for the glow. Neon needs a halo around every shape, and in Canvas2D that
+means `shadowBlur`, a real gaussian run per shape per frame, which *is* slow enough to notice.
+Against an SDF the same halo is `k / (k + d*d)` — one divide. The effect that would have cost the
+most is the one that comes free.
+
+What that buys, in about seventy lines of GLSL: cyan and magenta paddles with rounded caps, a
+ball drawn as a capsule swept along its own velocity so speed reads as a streak, a flash on each
+paddle when the server flips the ball's `vx`, a lit field boundary, dashed centre line, vignette
+and faint scanlines, all tone-mapped so the glow saturates instead of clipping.
+
+Geometry arrives as uniforms rather than baked into the shader, because `welcome` carries the
+server's dims and the client is supposed to honour whatever it is told.
+
+**No text is drawn on the canvas.** The score, countdown and labels are DOM, positioned over the
+letterboxed field by `resize()` and sized in `em` so they scale with it. They are crisper at any
+device pixel ratio, restyleable without touching a shader, and they are updated only when a value
+changes rather than every frame — which also drops four `fillText` calls and two `ctx.font`
+assignments out of the frame. `ctx.font` was the single most expensive call in the old loop, so
+the one honest performance win here came from moving text *out* of the renderer, not into it.
+
+A canvas keeps whichever context it first hands out, so `webgl2` is requested exactly once and
+`2d` is taken only if that came back null. The fallback draws the same shapes flat, without the
+glow it is standing in for. Context loss is handled: the program is dropped and rebuilt on
+restore.
+
+### The shader is the one thing no test runs
+
+There is no GPU in CI and no browser in the test suite, so `npm run check:client` reads the
+shader the way a compiler would instead. It checks that `#version 300 es` opens each unit (a
+leading newline is a hard error in GLSL ES), that braces and parens balance, that no `float` is
+assigned a bare int (there is no implicit conversion), that the fragment shader declares a
+precision and an `out vec4`, and that the uniform names the JS looks up, the ones it writes, and
+the ones the shaders declare are all the same set — a uniform that exists on only one side
+resolves to null and every write to it becomes a silent no-op.
+
 ## Beta telemetry
 
 "The ball is jittery" is not a thing a log can hold, so the client measures it
@@ -380,6 +422,7 @@ that is either flaky or vacuous.
 
 | Layer | Command | What only it can prove |
 | --- | --- | --- |
+| Page and shader | `npm run check:client` | That the page parses at all, that every id the script reaches for exists, and that the shader is structurally sound — the only code here no test executes |
 | Physics | `npm test` | Exact, in-process, no timers: tunneling, reflection, walls, scoring, the fairness invariant, and identical replay from a seed |
 | Client net math | `npm run test:predict` | Interpolation, clock tracking, slew bounds and ball smoothness, against hand-built burst and mis-stamp fixtures no live run can reproduce on demand |
 | Degraded network | `npm run test:impaired` | That a real game survives real latency, jitter and loss, that the server's timeline does not move when a client's link does, and that the telemetry path rejects hostile input |

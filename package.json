@@ -4,6 +4,7 @@
   "scripts": {
     "start": "node server.js",
     "test": "node server.js --selftest",
+    "check:client": "node scripts/checkclient.mjs",
     "test:predict": "node scripts/predict.test.mjs",
     "test:impaired": "node scripts/impaired.mjs",
     "smoke": "node scripts/smoke.mjs",

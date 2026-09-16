@@ -16,6 +16,9 @@ jobs:
           cache: npm
       - run: npm ci
       - run: node --check server.js
+      - name: Client parses
+        # the page is one inline <script>; nothing else in this job would ever notice it was broken
+        run: npm run check:client
       - run: npm test
       - name: Client net math
         run: npm run test:predict
