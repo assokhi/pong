@@ -6,6 +6,8 @@ on:
   pull_request:
 
 jobs:
+  # Fast gate: everything that needs no sockets and no browser. Seconds, so a typo or a one-sided
+  # protocol change fails long before the slow job has finished downloading a browser.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -15,16 +17,50 @@ jobs:
           node-version: "22"
           cache: npm
       - run: npm ci
+      - name: No merge artifacts anywhere in the repo
+        run: npm run check:repo
       - run: node --check server.js
-      - name: Client parses
-        # the page is one inline <script>; nothing else in this job would ever notice it was broken
+      - name: Client parses, and its shader is well formed
+        # the page is one inline <script>; nothing else here would notice it was broken
         run: npm run check:client
-      - run: npm test
+      - name: Physics, fairness, determinism
+        run: npm test
       - name: Client net math
         run: npm run test:predict
-      - name: Degraded-network system test
+      - name: Client and server still agree on the wire format
+        run: npm run test:contract
+
+  # Slow gate: anything that opens sockets, spawns servers or drives a browser. Runs beside `test`
+  # rather than after it, so fast failures still come back fast.
+  system:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - name: Cache the browser
+        id: pw
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          # playwright is pinned exactly, so the browser build is pinned with it
+          key: playwright-${{ runner.os }}-${{ hashFiles('package.json') }}
+      - name: Install Chromium
+        if: steps.pw.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps chromium chromium-headless-shell
+      - name: Browser system deps
+        if: steps.pw.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
+      - name: Concurrency, cadence under load, and reclamation
+        run: npm run test:load
+      - name: Degraded network
         # boots its own server and impairment proxy, so it needs nothing set up around it
         run: npm run test:impaired
+      - name: Real browser, real WebGL
+        run: npm run test:browser
       - name: Smoke test against a local server
         # no env overrides: the smoke test asks POST /room for its own short timings, so this
         # runs exactly the same path as the live deployment
@@ -39,7 +75,7 @@ jobs:
           kill "$(cat server.pid)"
 
   deploy:
-    needs: test
+    needs: [test, system]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     # Cancelling mid-rollout would leave the service in a state this workflow cannot reason about.

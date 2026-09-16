@@ -235,6 +235,9 @@ const server = http.createServer((req, res) => {
     return res.end(JSON.stringify({
       ok: true, version: process.env.RENDER_GIT_COMMIT ?? 'dev',
       rooms: rooms.size, uptime: Math.round(process.uptime()),
+      // Cheap to read and the only window into the single instance this design commits to:
+      // scripts/load.mjs watches both to prove rooms and sockets are actually reclaimed.
+      sockets: wss.clients.size, rssMb: Math.round(process.memoryUsage().rss / 1048576),
     }));
   }
   if (req.method === 'GET' && u.pathname === '/metrics') {

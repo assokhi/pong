@@ -1,0 +1,72 @@
+# Production canary. Everything in deploy.yml is a push gate: it proves the code was good at the
+# moment it shipped and then never looks again. This looks again.
+#
+# The failures it exists for are the ones no push can catch, because nothing was pushed: a free
+# instance that stops waking from cold start, a certificate that lapses, a rollback that quietly
+# left an older build serving traffic, a host-side change under a service that has not been
+# touched in weeks. The smoke suite already runs against any base URL and asks POST /room for its
+# own short timings, so pointing it at production needs no special mode and leaves nothing behind
+# but a few rooms that sweep themselves.
+name: canary
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"   # four times a day, off the hour so it misses the scheduler's rush
+  workflow_dispatch:         # and on demand, for when you want to know right now
+
+# A canary that piles up is a canary nobody reads.
+concurrency:
+  group: canary
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    env:
+      APP_URL: ${{ secrets.APP_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+
+      - name: Is it awake, and what is it serving
+        id: health
+        run: |
+          set -uo pipefail
+          if [ -z "${APP_URL:-}" ]; then
+            echo "::notice::APP_URL is not set, so there is nothing to probe. Add the secret to enable the canary."
+            echo "skip=yes" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The free tier sleeps. A cold start is ~60s and is not a fault, so the first request
+          # gets a long timeout and only a second failure counts as down.
+          for i in 1 2; do
+            t=$([ "$i" = 1 ] && echo 90 || echo 30)
+            if body=$(curl -sS --max-time "$t" "$APP_URL/health"); then
+              echo "$body" | jq .
+              echo "version=$(printf '%s' "$body" | jq -r '.version')" >> "$GITHUB_OUTPUT"
+              echo "skip=no" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "no answer on attempt $i"
+          done
+          echo "::error::$APP_URL/health did not answer twice running"
+          exit 1
+
+      - name: Full smoke suite against production
+        if: steps.health.outputs.skip == 'no'
+        run: npm run smoke "$APP_URL"
+
+      - name: Say what broke
+        if: failure() && steps.health.outputs.skip == 'no'
+        run: |
+          set -uo pipefail
+          echo "::error::the live service failed its canary"
+          echo "Serving version: ${{ steps.health.outputs.version }}"
+          echo "Compare that against the newest commit on main. If it is older, a deploy or a"
+          echo "rollback left the wrong build live and no push will tell you — re-run the deploy."
+          echo "If it matches, this is a real regression in production against code that passed CI."
+          curl -sS --max-time 30 "$APP_URL/health" || echo "(now unreachable entirely)"

@@ -42,7 +42,11 @@ flowchart LR
 | --- | --- |
 | [server.js](server.js) | HTTP, WebSocket, room registry, simulation, and the `--selftest` physics check |
 | [client.html](client.html) | the entire client: WebGL2 renderer, DOM HUD, input, prediction, reconnect |
-| [scripts/checkclient.mjs](scripts/checkclient.mjs) | parses the page and reads the shader as pedantically as a compiler would, since CI has no GPU |
+| [scripts/checkclient.mjs](scripts/checkclient.mjs) | parses the page and reads the shader as pedantically as a compiler would |
+| [scripts/checkrepo.mjs](scripts/checkrepo.mjs) | no merge artifact may be committed, anywhere — one already was |
+| [scripts/contract.mjs](scripts/contract.mjs) | the client and server still agree on the wire format, checked statically and against live frames |
+| [scripts/load.mjs](scripts/load.mjs) | many rooms at once: cadence under load, and whether rooms and sockets come back |
+| [scripts/browser.mjs](scripts/browser.mjs) | the client in real Chromium with real WebGL — the only gate that can see a shader |
 | [scripts/smoke.mjs](scripts/smoke.mjs) | end-to-end check against a running server |
 | [scripts/netmath.mjs](scripts/netmath.mjs) | lifts the client's net math out of `client.html` so tests drive the shipped code, and replays a captured session through it |
 | [scripts/predict.test.mjs](scripts/predict.test.mjs) | interpolation, clock slew and ball smoothness against built fixtures |
@@ -55,8 +59,12 @@ flowchart LR
 ```
 npm install          # one dependency: ws
 npm start            # http://localhost:8080   (PORT=... to change)
+npm run check:repo   # no merge artifacts anywhere in the repo
 npm run check:client # client.html parses, its ids exist, its shader is well formed
 npm test             # physics: tunneling, angle reflection, walls, scoring, fairness, determinism
+npm run test:contract# client and server still agree on the wire format
+npm run test:load    # 160 sockets across 16 rooms: cadence holds, everything is reclaimed
+npm run test:browser # real Chromium, real WebGL (needs: npx playwright install chromium)
 npm run test:predict # the client's interpolation and extrapolation, lifted out of client.html
 npm run test:impaired# a real game over a link with 150 ms latency, jitter and 3% loss
 npm run smoke        # end-to-end against a running server (pass a base URL to target another host)
@@ -171,7 +179,7 @@ sequenceDiagram
 | Method | Path | Response |
 | --- | --- | --- |
 | `POST` | `/room` | `{id, reserveMs, emptyMs, seed}`, room created. Optional JSON body `{reserveMs, emptyMs, seed}` overrides that room's disconnect reservation (500 ms – 60 s), its no-player TTL (1 s – 10 min), and the serve PRNG seed; out-of-range and junk values fall back to the defaults, and the body is capped at 1 KB. The response echoes the values actually used. A seed decides nothing but which way the ball is thrown, so there is nothing to gain by choosing one — it exists so a test can replay a game exactly |
-| `GET` | `/health` | `{ok, version, rooms, uptime}` — `version` is `RENDER_GIT_COMMIT` or `dev`. CI polls it to confirm the new process is serving traffic before smoke-testing it |
+| `GET` | `/health` | `{ok, version, rooms, uptime, sockets, rssMb}` — `version` is `RENDER_GIT_COMMIT` or `dev`. CI polls it to confirm the new process is serving traffic before smoke-testing it, the canary polls it every six hours, and `scripts/load.mjs` watches `sockets`/`rooms` to prove both are reclaimed |
 | `GET` | `/metrics?token=…` | The last 200 beta telemetry reports. **404 unless `PONG_METRICS_TOKEN` is set and matches** — these records carry players' free-text notes, so the default is that the endpoint does not exist. Compared by digest, not by string, so a wrong token leaks nothing including its length |
 | `GET` | `/` | landing page (create / join by id) |
 | `GET` | `/r/:id` | the same `client.html` |
@@ -420,16 +428,35 @@ Five layers, each asserting the thing it is actually able to observe. The split
 matters more than the count: put a claim in the wrong layer and you get a test
 that is either flaky or vacuous.
 
+CI runs these as two jobs in parallel. **`test`** is everything needing no sockets and no
+browser — it comes back in seconds, so a typo or a one-sided protocol change fails long before the
+other job has finished downloading a browser. **`system`** is everything that opens sockets,
+spawns servers or drives Chromium. `deploy` waits on both.
+
 | Layer | Command | What only it can prove |
 | --- | --- | --- |
-| Page and shader | `npm run check:client` | That the page parses at all, that every id the script reaches for exists, and that the shader is structurally sound — the only code here no test executes |
+| Repo hygiene | `npm run check:repo` | That no merge artifact is committed anywhere. A conflict marker once shipped to production through a fully green pipeline |
+| Page and shader | `npm run check:client` | That the page parses, that every id the script reaches for exists, and that the shader is structurally sound |
 | Physics | `npm test` | Exact, in-process, no timers: tunneling, reflection, walls, scoring, the fairness invariant, and identical replay from a seed |
-| Client net math | `npm run test:predict` | Interpolation, clock tracking, slew bounds and ball smoothness, against hand-built burst and mis-stamp fixtures no live run can reproduce on demand |
-| Degraded network | `npm run test:impaired` | That a real game survives real latency, jitter and loss, that the server's timeline does not move when a client's link does, and that the telemetry path rejects hostile input |
+| Protocol contract | `npm run test:contract` | That the two halves still agree. Every type one side sends the other handles, no dead branches either way, and every field on a live frame is one `client.html` actually reads |
+| Client net math | `npm run test:predict` | Interpolation, clock tracking, slew bounds and ball smoothness, against burst and mis-stamp fixtures no live run can reproduce on demand |
+| Concurrency | `npm run test:load` | That the sim's cadence does not stretch as rooms multiply, and that rooms and sockets are genuinely reclaimed — the leak test for a design pinned to one instance |
+| Degraded network | `npm run test:impaired` | That a real game survives real latency, jitter and loss, that the server's timeline does not move when a client's link does, and that telemetry rejects hostile input |
+| Real browser | `npm run test:browser` | That the shader **compiles on an actual driver**, the canvas is lit and moving, mouse reaches the server's paddle, and the page survives a resize. Nothing else here ever loads the page |
 | End to end | `npm run smoke` | The whole protocol over real sockets: slots, spectators, tokens, reservations, sweeps, keepalive |
 | Deploy | CI, on push | That the process now serving traffic is this commit, and that it still passes the end-to-end suite in production |
+| Canary | CI, every 6 h | That production is *still* fine when nobody has pushed: cold starts, certificates, a rollback that left an older build live |
 
-Three of those deserve a note.
+Four of those deserve a note.
+
+**The browser gate is the only one that can see a shader.** Everything else here talks to the
+server over a socket and never loads the page — which is exactly how a `client.html` that did not
+parse once sailed through a green pipeline and deployed. `check:client` closed the parse hole, but
+a shader is not a parse problem: GLSL that is perfectly well formed can still fail to compile on a
+driver, and nothing short of a driver can say otherwise. Playwright is a dev dependency only; the
+runtime still has exactly one. It is pinned to an exact version because the browser binary is
+downloaded per release, and a floating range means CI silently tests on a different Chromium than
+anyone ran locally.
 
 **Determinism is asserted in-process, not across two live runs.** The obvious
 system test — run one seeded game clean, one impaired, assert the same final

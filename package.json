@@ -3,14 +3,21 @@
   "private": true,
   "scripts": {
     "start": "node server.js",
-    "test": "node server.js --selftest",
+    "check:repo": "node scripts/checkrepo.mjs",
     "check:client": "node scripts/checkclient.mjs",
+    "test": "node server.js --selftest",
+    "test:contract": "node scripts/contract.mjs",
     "test:predict": "node scripts/predict.test.mjs",
+    "test:load": "node scripts/load.mjs",
     "test:impaired": "node scripts/impaired.mjs",
+    "test:browser": "node scripts/browser.mjs",
     "smoke": "node scripts/smoke.mjs",
     "netshape": "node scripts/netshape.mjs"
   },
   "dependencies": {
     "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "playwright": "1.62.0"
   }
 }
