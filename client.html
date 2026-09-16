@@ -1,44 +1,210 @@
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
 <title>Pong</title>
 <style>
-  html, body { margin: 0; height: 100%; background: #000; color: #fff; overflow: hidden;
-    font: 14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-  canvas { position: fixed; inset: 0; touch-action: none; }
-  #ui { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; pointer-events: none; }
-  .box { background: #000d; border: 1px solid #fff; padding: 20px 26px; text-align: center;
-    pointer-events: auto; line-height: 1.9; max-width: 90vw; }
-  button, input { font: inherit; margin: 4px; padding: 8px 14px; border: 1px solid #fff; }
-  button { background: #fff; color: #000; cursor: pointer; }
-  input { background: #000; color: #fff; width: 9em; }
-  #note { position: fixed; top: 8px; left: 0; right: 0; text-align: center; opacity: .8; }
-  .link { user-select: all; opacity: .7; font-size: 12px; word-break: break-all; }
+  html, body { margin: 0; height: 100%; background: #05060d; color: #e8f4ff; overflow: hidden;
+    font: 500 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    -webkit-font-smoothing: antialiased; }
+  canvas { position: fixed; inset: 0; display: block; touch-action: none; }
+
+  /* Every text-shaped thing lives in the DOM rather than on the canvas: crisper at any dpr,
+     restyled without touching a shader, and it takes four fillText calls and two ctx.font
+     assignments out of every frame — ctx.font was the most expensive call in the old loop.
+     resize() lays #stage exactly over the letterboxed field, so em units inside scale with it. */
+  #stage { position: fixed; pointer-events: none; font-size: 16px; }
+
+  #score { position: absolute; top: .85em; left: 0; right: 0; text-align: center; line-height: 1;
+    font-size: 2.8em; font-weight: 700; letter-spacing: .08em; font-variant-numeric: tabular-nums; }
+  #score span { padding: 0 .38em; }
+  #sa { color: #5ceeff; text-shadow: 0 0 .32em rgba(34,230,255,.8), 0 0 1.1em rgba(34,230,255,.35); }
+  #sb { color: #ff7fd0; text-shadow: 0 0 .32em rgba(255,63,180,.8), 0 0 1.1em rgba(255,63,180,.35); }
+
+  #cd { position: absolute; inset: 0; display: grid; place-items: center; font-size: 5em;
+    font-weight: 700; color: #fff; text-shadow: 0 0 .28em rgba(255,255,255,.65); }
+
+  #foot { position: absolute; left: 0; right: 0; bottom: .7em; display: flex;
+    justify-content: space-between; padding: 0 1.1em; font-size: .8em; letter-spacing: .1em;
+    text-transform: uppercase; color: #7b93ad; }
+
+  #note { position: fixed; top: 14px; left: 0; right: 0; text-align: center; font-size: 12px;
+    letter-spacing: .12em; text-transform: uppercase; color: #9fd8ff; pointer-events: none;
+    text-shadow: 0 0 .9em rgba(80,200,255,.55); }
+
+  #ui { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    pointer-events: none; padding: 16px; }
+  .box { pointer-events: auto; max-width: min(92vw, 30em); padding: 26px 30px; text-align: center;
+    line-height: 1.85; border: 1px solid rgba(120,200,255,.28); border-radius: 14px;
+    background: rgba(6,10,22,.82); backdrop-filter: blur(14px);
+    box-shadow: 0 18px 60px rgba(0,0,0,.7), 0 0 70px rgba(40,160,255,.10); }
+  .box b { display: block; font-size: 2.1em; letter-spacing: .42em; text-indent: .42em;
+    margin-bottom: .1em; color: #eaf6ff; }
+  @supports (-webkit-background-clip: text) {
+    .box b { background: linear-gradient(90deg, #22e6ff, #ff3fb4); -webkit-background-clip: text;
+      background-clip: text; color: transparent; }
+  }
+  .sub { display: block; color: #7b93ad; font-size: .82em; letter-spacing: .1em;
+    text-transform: uppercase; margin-bottom: .5em; }
+
+  button, input { font: inherit; margin: 5px 4px; padding: 10px 18px; border-radius: 9px;
+    letter-spacing: .06em; }
+  button { border: 1px solid rgba(120,220,255,.5); background: rgba(34,230,255,.10); color: #d8f6ff;
+    cursor: pointer; transition: background .15s, box-shadow .15s, border-color .15s; }
+  button:hover:enabled { background: rgba(34,230,255,.2); border-color: rgba(120,220,255,.9);
+    box-shadow: 0 0 18px rgba(34,230,255,.3); }
+  button:disabled { opacity: .45; cursor: default; }
+  button:focus-visible, input:focus-visible { outline: 2px solid #22e6ff; outline-offset: 2px; }
+  input { border: 1px solid rgba(120,200,255,.3); background: rgba(0,0,0,.5); color: #e8f4ff; width: 9em; }
+
+  .link { user-select: all; font-size: .78em; color: #6f8bab; word-break: break-all; margin-top: .6em; }
+  @media (prefers-reduced-motion: reduce) { button { transition: none; } }
 </style>
 <canvas id="c"></canvas>
+<div id="stage">
+  <div id="score"><span id="sa">0</span><span id="sb">0</span></div>
+  <div id="cd"></div>
+  <div id="foot"><span id="fspec">spectators 0</span><span id="frole">watching</span></div>
+</div>
 <div id="ui"></div>
-<div id="note"></div>
+<div id="note" aria-live="polite"></div>
 <script>
-const cv = document.getElementById('c'), ctx = cv.getContext('2d'), uiEl = document.getElementById('ui');
-const noteEl = document.getElementById('note');
+const cv = document.getElementById('c'), uiEl = document.getElementById('ui');
+const noteEl = document.getElementById('note'), stageEl = document.getElementById('stage');
+const saEl = document.getElementById('sa'), sbEl = document.getElementById('sb');
+const cdEl = document.getElementById('cd');
+const fspecEl = document.getElementById('fspec'), froleEl = document.getElementById('frole');
+let ctx = null;   // only ever set if WebGL2 turns out to be unavailable
 const roomId = location.pathname.startsWith('/r/') ? location.pathname.slice(3) : '';
+/*<net>*/
+// ponytail: fenced so scripts/predict.test.mjs can lift this block out and run it under node:vm.
+// Nothing in here may touch the DOM or the network. Upgrade path if the fence ever chafes: make
+// it a served module and import it.
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 const lerp = (a, b, u) => a + (b - a) * u;
 const V = { W: 800, H: 450, R: 7, PW: 12, PH: 80, AX: 24, BX: 764, SPEED: 700, WIN: 11 };
-const BUFFER = 100; // ms of interpolation delay
+let BUFFER = 100;                  // ms of interpolation delay
+let buf = [], off = null, rttMs = 0;
+let offs = [], offTarget = null, rttTarget = 0, rttSeen = false;
+let sA = null, sB = null, su = 0;  // interpolation pair, kept out of the render loop to avoid allocation
+let ballX = 0, ballY = 0;          // likewise: ballAt() writes here rather than returning a point
+let jitterPx = -1;                 // smoothness of the drawn ball this frame; -1 when not measurable
+let ballAge = 0;                   // seconds of extrapolation behind the drawn ball
+const OFFW = 64;                   // ~2.5 s of snapshots in the offset window
+const SLEW = 15;                   // ms of clock correction per second of wall time
 
-let ws = null, role = null, chosen = false, buf = [], myY = V.H / 2, tgt = V.H / 2, sentY = null, sentAt = 0;
+// Snapshots play back on the SERVER's clock, never on arrival time. A lost segment stalls every
+// snapshot queued behind it — this is TCP, so nothing is dropped, it is delayed — and then five
+// arrive in the same millisecond. Keyed off arrival, that burst gave five frames near-identical
+// timestamps, sample() walked back to the oldest frame still buffered, and the opponent's paddle
+// crawled and then lurched: 164 ms of game time in a single frame, against 10 ms once the same
+// fixture is played on m.t (scripts/predict.test.mjs measures exactly this). m.t stays 40 ms
+// apart however the bytes actually turned up.
+//
+// The offset is the minimum of (local - server) over a sliding window: the least-delayed sample in
+// recent memory is the one that spent the least time in transit, so it is the closest look at the
+// true offset. A window rather than an all-time minimum, because an all-time minimum is pinned
+// forever by one anomalously fast early packet and can never recover if the server's clock moves.
+function trackClock(serverT, localNow) {
+  offs.push(localNow - serverT);
+  if (offs.length > OFFW) offs.shift();
+  let m = Infinity;
+  for (const v of offs) if (v < m) m = v;
+  offTarget = m;
+  if (off === null) off = m;   // cold start: adopt it, there is nothing yet to be smooth against
+}
+
+// Both the offset and the round trip are revisions to where the whole extrapolated world sits, so
+// applying one as a step teleports the ball: at 900px/s a 40ms revision moves it 18px in a single
+// frame. Bleed them in instead. 15ms/s costs a 1.5% velocity error no eye can catch and still
+// closes a 100ms correction in under seven seconds. The first measurement of each is adopted
+// outright — there is nothing to be smooth relative to yet, and starting 5s behind is worse.
+function slew(dtMs) {
+  const d = Math.min(dtMs, 100) * SLEW / 1000;
+  if (offTarget !== null) off += clamp(offTarget - off, -d, d);
+  rttMs += clamp(rttTarget - rttMs, -d * 2, d * 2);
+}
+
+function setRtt(ms) {
+  rttTarget = ms;
+  if (!rttSeen) { rttSeen = true; rttMs = ms; }
+}
+
+function pushSnap(m, localNow) {
+  trackClock(m.t, localNow);
+  buf.push(m);
+  if (buf.length > 12) buf.shift();
+}
+
+function sample(now) {
+  const rt = now - BUFFER;
+  let i = buf.length - 1;
+  while (i > 0 && buf[i].t + off > rt) i--;
+  sA = buf[i]; sB = buf[i + 1] || buf[i];
+  su = buf[i + 1] ? clamp((rt - (buf[i].t + off)) / (buf[i + 1].t - buf[i].t || 1), 0, 1) : 0;
+}
+
+// Paddles are interpolated from the past, but the ball must not be: between bounces it flies in a
+// straight line, so where it is *now* follows exactly from the newest snapshot. Drawing it in the
+// past let the server award points while the ball still looked a tenth of the field short of the
+// paddle — the player saw a shot they could still reach, and lost it anyway.
+//
+// off already absorbs the baseline one-way delay, so rttMs/2 is what remains to carry the ball
+// from "when this snapshot would have arrived" to "where it is now". The two terms are
+// complementary, not two spellings of the same correction.
+let pBX = 0, pBY = 0, pVX = 0, pVY = 0, pNow = 0, pClean = false;
+function ballAt(s, now) {
+  ballX = s.ball.x; ballY = s.ball.y;
+  if (s.status !== 'play') { pClean = false; jitterPx = -1; return; }
+  // Two different quantities, and only one of them is a risk. rtt/2 is a standing, measured
+  // correction that is always right to apply. Staleness — how long since this snapshot should have
+  // reached us — is the one that runs away when a connection dies, so it is the one that gets
+  // capped. Capping their sum instead pins the ball at the ceiling for the whole of a 300ms+ link:
+  // the extrapolation stops responding to time and the ball advances only when a snapshot lands,
+  // stepping ~16px at 21Hz. That looks exactly like the jitter the cap was supposed to prevent.
+  const stale = (now - (s.t + off)) / 1000;
+  const held = Math.min(stale, 0.25);
+  const age = ballAge = held + rttMs / 2000;
+  ballX += s.ball.vx * age;
+  ballY += s.ball.vy * age;
+  let clean = stale === held;                         // a capped ball is frozen, not smooth
+  if (ballY < V.R) { ballY = 2 * V.R - ballY; clean = false; }             // walls bounce predictably
+  else if (ballY > V.H - V.R) { ballY = 2 * (V.H - V.R) - ballY; clean = false; }
+  // Contact is the server's call, so never run the ball past a paddle ahead of the verdict.
+  const fa = V.AX + V.PW + V.R, fb = V.BX - V.R;
+  if (s.ball.x >= fa && ballX < fa) { ballX = fa; clean = false; }
+  if (s.ball.x <= fb && ballX > fb) { ballX = fb; clean = false; }
+
+  // Smoothness, measured where the word means something. In free flight the drawn ball must
+  // advance by exactly velocity x frame time; any other distance is the extrapolation
+  // contradicting itself between two frames, which is precisely what a player calls jitter.
+  // Bounces, face clamps and capped ages are excluded — those are known discontinuities, not
+  // defects, and counting them would bury the signal this number exists to carry.
+  jitterPx = (clean && pClean && pVX === s.ball.vx && pVY === s.ball.vy)
+    ? Math.hypot(ballX - pBX - s.ball.vx * (now - pNow) / 1000,
+                 ballY - pBY - s.ball.vy * (now - pNow) / 1000)
+    : -1;
+  pBX = ballX; pBY = ballY; pVX = s.ball.vx; pVY = s.ball.vy; pNow = now; pClean = clean;
+}
+/*</net>*/
+
+// Hand-testing knobs: ?buffer=250 widens the jitter cushion, ?rtt=200 pins the extrapolation
+// distance so you can see what a given latency looks like without actually having it.
+const qs = new URLSearchParams(location.search);
+let rttPin = false;
+if (qs.has('buffer')) BUFFER = Math.max(0, +qs.get('buffer') || 0);
+if (qs.has('rtt')) { rttMs = rttTarget = Math.max(0, +qs.get('rtt') || 0); rttSeen = rttPin = true; }
+
+let ws = null, role = null, chosen = false, welcomed = false, myY = V.H / 2, tgt = V.H / 2;
+let sentY = null, sentAt = 0;
 let lastTgt = null, tgtAt = 0; // when the player last asked the paddle to go somewhere new
-let ackT = 0, rttMs = 0;      // newest snapshot's server time, and the round trip the server measured
 let scale = 1, ox = 0, oy = 0, dpr = 1, uiKey = null;
-let sA = null, sB = null, su = 0; // interpolation pair, kept out of the render loop to avoid allocation
-let sScore = '0  0', sSpec = 'spectators 0', roleLabel = 'watching', lastScore = -1, lastSpec = -1;
+let roleLabel = 'watching';
+let lastA = -1, lastB = -1, lastCd = null, lastSpec = -1, lastRole = null;
 const CD = ['', '1', '2'];
 const TAU = Math.PI * 2;
 
 function note(t) { noteEl.textContent = t; clearTimeout(note.t); note.t = setTimeout(() => noteEl.textContent = '', 4000); }
 
-<<<<<<< Updated upstream
-=======
 /* ---------- beta telemetry ---------- */
 // What a player means by "the ball is jittery" is not a feeling the logs can hold, so the client
 // measures it: jitMed/jitP95/jitMax are how far the drawn ball departed from velocity x frame time
@@ -47,9 +213,8 @@ function note(t) { noteEl.textContent = t; clearTimeout(note.t); note.t = setTim
 const CAP = 3000;                       // bound the sample arrays if a send ever fails to fire
 let tele = null;
 function resetTele() {
-  // Every field describes this window and only this window, so a run of reports sums to the
-  // session. A counter that carried over would read as a spike in whichever window happened to
-  // send after it.
+    // Every field describes this window and only this window, so a run of reports sums to the
+  // session. A counter that carried over would read as a spike in whichever window sent next.
   tele = { t0: performance.now(), snaps: 0, reconnects: 0, gaps: [], jit: [],
            frames: 0, underruns: 0, clamped: 0, stalls: 0, ageMax: 0, lastAt: 0 };
 }
@@ -83,11 +248,11 @@ function sendTele(text) {
 }
 setInterval(() => { if (tele.frames) sendTele(); }, 15000);
 
->>>>>>> Stashed changes
 /* ---------- landing ---------- */
 if (!roomId) {
-  uiEl.innerHTML = '<div class=box><b>PONG</b><br><button id=mk>Create room</button><br>' +
-    '<input id=jid placeholder="room id"><button id=jn>Join</button></div>';
+  uiEl.innerHTML = '<div class=box><b>PONG</b><span class=sub>two players, many spectators</span>' +
+    '<button id=mk>Create room</button><br>' +
+    '<input id=jid placeholder="room id" aria-label="room id"><button id=jn>Join</button></div>';
   mk.onclick = async () => {
     const r = await fetch('/room', { method: 'POST' });
     location.href = '/r/' + (await r.json()).id;
@@ -131,15 +296,21 @@ function connect(r, token) {
     if (m.type === 'welcome') {
       Object.assign(V, m.dims); setRole(m.role, m.token); resize();
       attempt = 0; retryUntil = 0;
+      if (!welcomed) { welcomed = true; note('press F if anything feels wrong'); }
       if (uiKey === 'gone') { uiKey = null; uiEl.innerHTML = ''; } // clear "reconnecting…"
     }
     else if (m.type === 'role') { setRole(m.role, m.token); note('you are now player ' + m.role.toUpperCase()); }
-    else if (m.type === 'lag') rttMs = m.ms;
+    else if (m.type === 'lag') { if (!rttPin) setRtt(m.ms); }
     else if (m.type === 'bye') { farewell = m; sock.close(); }
     else if (m.type === 'state') {
-      ackT = m.t;
-      buf.push({ t: performance.now(), s: m });
-      if (buf.length > 12) buf.shift();
+      const at = performance.now();
+      if (tele.lastAt) {
+        const gap = at - tele.lastAt;
+        if (tele.gaps.length < CAP) tele.gaps.push(gap);
+        if (gap > 200) tele.stalls++;      // a retransmit-sized hole in an otherwise 40ms stream
+      }
+      tele.lastAt = at; tele.snaps++;
+      pushSnap(m, at);
       if (role) reconcile(m.paddles[role]);
       ui(m);
     }
@@ -157,6 +328,7 @@ function connect(r, token) {
     if (code === 4004) return box('server restarting — reconnect in a moment', 'soon');
     if (DELIBERATE.includes(code)) return box('disconnected' + (reason ? ' — ' + reason : ''), 'now');
     // Unexpected drop (mobile handover, wifi blip): retry with backoff for ~30 s.
+    tele.reconnects++;
     if (!retryUntil) retryUntil = Date.now() + 30e3;
     if (Date.now() >= retryUntil) return box('could not reconnect', 'now');
     const wait = Math.round(Math.min(250 * 2 ** attempt, 5000) * (0.8 + Math.random() * 0.4));
@@ -186,7 +358,7 @@ function setRole(r, token) {
   role = r;
   roleLabel = r ? 'you: player ' + r.toUpperCase() : 'watching';
   if (token) sessionStorage.setItem('tok:' + roomId, token);
-  if (r && buf.length) myY = tgt = buf[buf.length - 1].s.paddles[r];
+  if (r && buf.length) myY = tgt = buf[buf.length - 1].paddles[r];
   sentY = null; uiKey = null;
 }
 
@@ -226,32 +398,197 @@ const keys = Object.create(null);
 const toY = cy => clamp((cy * dpr - oy) / scale, V.PH / 2, V.H - V.PH / 2);
 addEventListener('mousemove', e => { if (role) tgt = toY(e.clientY); });
 addEventListener('touchmove', e => { if (role) { tgt = toY(e.touches[0].clientY); e.preventDefault(); } }, { passive: false });
-addEventListener('keydown', e => { keys[e.key] = 1; if (e.key.startsWith('Arrow')) e.preventDefault(); });
+addEventListener('keydown', e => {
+  keys[e.key] = 1;
+  if (e.key.startsWith('Arrow')) e.preventDefault();
+  // Beta feedback. The note travels with the session's own measurements, so a report arrives as
+  // "felt laggy near the right paddle" *next to* the numbers for that minute, rather than alone.
+  // ponytail: prompt() blocks the render loop for as long as it is open. Fine for a beta key,
+  // replace with an in-page field if it ever ships to players who did not opt into one.
+  if (e.key === 'f' || e.key === 'F') {
+    const text = prompt('What went wrong? Sent with this session\'s network and smoothness metrics.');
+    if (text && text.trim()) { sendTele(text.trim().slice(0, 500)); note('sent — thank you'); }
+  }
+});
 addEventListener('keyup', e => { keys[e.key] = 0; });
 addEventListener('resize', resize);
 
 function resize() {
   dpr = devicePixelRatio || 1;
-  cv.width = innerWidth * dpr; cv.height = innerHeight * dpr;
+  cv.width = Math.round(innerWidth * dpr); cv.height = Math.round(innerHeight * dpr);
   cv.style.width = innerWidth + 'px'; cv.style.height = innerHeight + 'px';
   scale = Math.min(cv.width / V.W, cv.height / V.H);       // letterbox, never simulate in pixels
   ox = (cv.width - V.W * scale) / 2; oy = (cv.height - V.H * scale) / 2;
+  // Lay the text layer exactly over the field, in CSS px, and scale its type with it, so the
+  // score sits on the play area rather than on the window.
+  const w = V.W * scale / dpr, h = V.H * scale / dpr;
+  stageEl.style.left = (ox / dpr) + 'px'; stageEl.style.top = (oy / dpr) + 'px';
+  stageEl.style.width = w + 'px'; stageEl.style.height = h + 'px';
+  stageEl.style.fontSize = Math.max(9, h / V.H * 16) + 'px';
 }
+
+/* ---------- renderer ---------- */
+// The playfield is one fullscreen triangle and every shape in it is a signed distance field, so
+// the neon halo costs a divide per shape instead of a blur. That is the whole reason this is a
+// shader: the ~23 draw calls the 2D path made were never slow, but the glow they would need is —
+// shadowBlur is a real gaussian, per shape, per frame. No text is drawn here at all; that is DOM.
+//
+// Geometry arrives as uniforms rather than baked into the shader, because `welcome` carries the
+// server's dims and the client is supposed to honour whatever it is told.
+const VS = `#version 300 es
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+uniform vec2 uRes;     // drawing buffer, device px
+uniform vec3 uView;    // scale, ox, oy - the same letterbox the 2D path uses
+uniform vec4 uField;   // W, H, ball radius, ball alpha
+uniform vec4 uGeom;    // paddle AX, BX, width, height
+uniform vec4 uBall;    // x, y, vx, vy  (virtual units)
+uniform vec4 uPad;     // a.y, b.y, hit flash a, hit flash b
+out vec4 fragColor;
+
+float sdBox(vec2 p, vec2 b) { vec2 d = abs(p) - b; return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0); }
+
+// The ball is a capsule swept along its own velocity, so speed reads as a streak for free.
+float sdSeg(vec2 p, vec2 a, vec2 b) {
+  vec2 pa = p - a, ba = b - a;
+  float l2 = dot(ba, ba);
+  float h = l2 > 1e-4 ? clamp(dot(pa, ba) / l2, 0.0, 1.0) : 0.0;
+  return length(pa - ba * h);
+}
+
+float core(float d) { return smoothstep(1.1, -0.5, d); }   // antialiased solid body
+float halo(float d, float k) { return k / (k + d * d); }   // inverse-square falloff: the whole trick
+
+vec3 neon(float d, vec3 tint, float k, float amt) {
+  return mix(tint, vec3(1.0), 0.72) * core(d) + tint * halo(d, k) * amt;
+}
+
+void main() {
+  float W = uField.x, H = uField.y, BR = uField.z;
+  float AX = uGeom.x, BX = uGeom.y, PW = uGeom.z, PH = uGeom.w;
+
+  vec2 fc = vec2(gl_FragCoord.x, uRes.y - gl_FragCoord.y);   // GL counts y from the bottom
+  vec2 p = (fc - uView.yz) / uView.x;                        // into the virtual play space
+
+  vec2 n = p / vec2(W, H) - 0.5;
+  float vig = smoothstep(0.98, 0.12, length(n * vec2(1.05, 1.25)));
+  vec3 col = vec3(0.012, 0.018, 0.042) * (0.40 + 0.60 * vig);
+
+  // the field boundary, so the play area still reads when nothing is moving
+  float dEdge = abs(sdBox(p - vec2(W, H) * 0.5, vec2(W, H) * 0.5 - 1.0));
+  col += vec3(0.16, 0.42, 0.62) * halo(dEdge, 1.6) * 0.45;
+
+  float dMid = sdBox(vec2(p.x - W * 0.5, mod(p.y + 7.0, 26.0) - 13.0), vec2(1.0, 7.0));
+  col += vec3(0.20, 0.46, 0.68) * (core(dMid) * 0.30 + halo(dMid, 2.5) * 0.10);
+
+  float dA = sdBox(p - vec2(AX + PW * 0.5, uPad.x), vec2(PW * 0.5 - 4.0, PH * 0.5 - 4.0)) - 4.0;
+  float dB = sdBox(p - vec2(BX + PW * 0.5, uPad.y), vec2(PW * 0.5 - 4.0, PH * 0.5 - 4.0)) - 4.0;
+  col += neon(dA, vec3(0.13, 0.90, 1.00), 110.0, 0.42 + uPad.z * 1.6);
+  col += neon(dB, vec3(1.00, 0.24, 0.71), 110.0, 0.42 + uPad.w * 1.6);
+
+  float dBall = sdSeg(p, uBall.xy - uBall.zw * 0.020, uBall.xy) - BR;
+  col += neon(dBall, vec3(1.00, 0.93, 0.80), 150.0, 0.62) * uField.w;
+
+  col = 1.0 - exp(-col * 1.45);                              // hold the glow short of blowing out
+  col *= 1.0 - 0.055 * (0.5 + 0.5 * cos(p.y * 3.14159));     // faint scanlines
+  fragColor = vec4(col, 1.0);
+}`;
+
+let gl = null, glProg = null;
+const glU = {};
+
+function buildProgram() {
+  const compile = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (gl.getShaderParameter(s, gl.COMPILE_STATUS)) return s;
+    console.warn('pong: shader did not compile\n' + gl.getShaderInfoLog(s));
+    return null;
+  };
+  const vs = compile(gl.VERTEX_SHADER, VS), fs = compile(gl.FRAGMENT_SHADER, FS);
+  if (!vs || !fs) return false;
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    console.warn('pong: program did not link\n' + gl.getProgramInfoLog(p));
+    return false;
+  }
+  gl.useProgram(p);
+  gl.bindVertexArray(gl.createVertexArray());   // core wants one bound even with no attributes
+  for (const n of ['uRes', 'uView', 'uField', 'uGeom', 'uBall', 'uPad']) glU[n] = gl.getUniformLocation(p, n);
+  glProg = p;
+  return true;
+}
+
+// A canvas keeps whichever context it first hands out, so 2d remains available only while every
+// webgl2 request has come back null. Ask once, and fall back in the same breath.
+function initRenderer() {
+  gl = cv.getContext('webgl2', {
+    alpha: false, antialias: false, depth: false, stencil: false, powerPreference: 'high-performance',
+  });
+  if (gl && buildProgram()) {
+    cv.addEventListener('webglcontextlost', e => { e.preventDefault(); glProg = null; });
+    cv.addEventListener('webglcontextrestored', () => { if (buildProgram()) resize(); });
+    return;
+  }
+  gl = null;
+  ctx = cv.getContext('2d');
+}
+
+function drawGL(s, padA, padB) {
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.uniform2f(glU.uRes, cv.width, cv.height);
+  gl.uniform3f(glU.uView, scale, ox, oy);
+  gl.uniform4f(glU.uField, V.W, V.H, V.R, s.status === 'over' ? 0 : 1);
+  gl.uniform4f(glU.uGeom, V.AX, V.BX, V.PW, V.PH);
+  const live = s.status === 'play';
+  gl.uniform4f(glU.uBall, ballX, ballY, live ? s.ball.vx : 0, live ? s.ball.vy : 0);
+  gl.uniform4f(glU.uPad, padA, padB, hitA, hitB);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+// Fallback for no WebGL2: the same shapes, flat. Plain fills only — the glow this stands in for
+// would cost more here than the whole rest of the frame.
+function draw2D(s, padA, padB) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = '#05060d'; ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.setTransform(scale, 0, 0, scale, ox, oy);
+  ctx.fillStyle = '#16304a';
+  for (let y = 6; y < V.H; y += 26) ctx.fillRect(V.W / 2 - 1, y, 2, 14);
+  ctx.fillStyle = '#22e6ff'; ctx.fillRect(V.AX, padA - V.PH / 2, V.PW, V.PH);
+  ctx.fillStyle = '#ff3fb4'; ctx.fillRect(V.BX, padB - V.PH / 2, V.PW, V.PH);
+  if (s.status !== 'over') {
+    ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.arc(ballX, ballY, V.R, 0, TAU); ctx.fill();
+  }
+}
+
+// The HUD is DOM, so it is touched only when a value actually changes, not every frame.
+function hud(s) {
+  if (s.score.a !== lastA) { lastA = s.score.a; saEl.textContent = s.score.a; }
+  if (s.score.b !== lastB) { lastB = s.score.b; sbEl.textContent = s.score.b; }
+  const cd = s.status === 'count' ? (CD[Math.ceil(s.cd)] || '') : '';
+  if (cd !== lastCd) { lastCd = cd; cdEl.textContent = cd; }
+  if (s.spectators !== lastSpec) { lastSpec = s.spectators; fspecEl.textContent = 'spectators ' + s.spectators; }
+  if (roleLabel !== lastRole) { lastRole = roleLabel; froleEl.textContent = roleLabel; }
+}
+
+initRenderer();
 resize();
 
-/* ---------- render ---------- */
-function sample(now) {
-  const rt = now - BUFFER;
-  let i = buf.length - 1;
-  while (i > 0 && buf[i].t > rt) i--;
-  sA = buf[i].s; sB = buf[i + 1] ? buf[i + 1].s : buf[i].s;
-  su = buf[i + 1] ? clamp((rt - buf[i].t) / (buf[i + 1].t - buf[i].t || 1), 0, 1) : 0;
-}
-
 let prev = performance.now();
+let hitA = 0, hitB = 0, lastVX = 0;
+
 function frame(now) {
   requestAnimationFrame(frame);
   const dt = Math.min(0.05, (now - prev) / 1000); prev = now;
+  slew(dt * 1000);
 
   if (role) { // local prediction of my own paddle
     const k = (keys.ArrowUp || keys.w || keys.W ? -1 : 0) + (keys.ArrowDown || keys.s || keys.S ? 1 : 0);
@@ -259,57 +596,40 @@ function frame(now) {
     if (tgt !== lastTgt) { lastTgt = tgt; tgtAt = now; } // mouse, touch and keys all land here
     myY += clamp(tgt - myY, -V.SPEED * dt, V.SPEED * dt);
     if (tgt !== sentY && now - sentAt >= 16 && ws.readyState === 1) { // capped at ~60 msg/s
-      ws.send('{"type":"input","y":' + tgt.toFixed(1) + ',"ack":' + ackT + '}');
+      ws.send('{"type":"input","y":' + tgt.toFixed(1) + '}');
       sentY = tgt; sentAt = now;
     }
   }
 
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, cv.width, cv.height);
   if (!buf.length) return;
   sample(now);
-  const s = buf[buf.length - 1].s;
+  const s = buf[buf.length - 1];
+  const padA = role === 'a' ? myY : lerp(sA.paddles.a, sB.paddles.a, su);
+  const padB = role === 'b' ? myY : lerp(sA.paddles.b, sB.paddles.b, su);
 
-  ctx.setTransform(scale, 0, 0, scale, ox, oy);
-  ctx.fillStyle = '#222';
-  for (let y = 6; y < V.H; y += 26) ctx.fillRect(V.W / 2 - 1, y, 2, 14);
-  ctx.fillStyle = '#fff';
-  ctx.fillRect(V.AX, (role === 'a' ? myY : lerp(sA.paddles.a, sB.paddles.a, su)) - V.PH / 2, V.PW, V.PH);
-  ctx.fillRect(V.BX, (role === 'b' ? myY : lerp(sA.paddles.b, sB.paddles.b, su)) - V.PH / 2, V.PW, V.PH);
+  tele.frames++;
+  if (sA === sB) tele.underruns++;   // the buffer ran dry: nothing left to interpolate toward
+
+  // Paddle hit flash. The server flips vx on contact, so the sign change is the event; the
+  // position test keeps a serve from the centre line from reading as a hit.
+  if (s.ball.vx !== lastVX) {
+    if (lastVX < 0 && s.ball.vx > 0 && s.ball.x < V.W * 0.3) hitA = 1;
+    else if (lastVX > 0 && s.ball.vx < 0 && s.ball.x > V.W * 0.7) hitB = 1;
+    lastVX = s.ball.vx;
+  }
+  hitA = Math.max(0, hitA - dt * 3.5);
+  hitB = Math.max(0, hitB - dt * 3.5);
+
   if (s.status !== 'over') {
-    // Paddles are interpolated from the past, but the ball must not be: between bounces it flies
-    // in a straight line, so where it is *now* follows exactly from the newest snapshot. Drawing
-    // it in the past let the server award points while the ball still looked a tenth of the field
-    // short of the paddle — the player saw a shot they could still reach, and lost it anyway.
-    let bx = s.ball.x, by = s.ball.y;
-    if (s.status === 'play') {
-      const age = Math.min((now - buf[buf.length - 1].t + rttMs / 2) / 1000, 0.25);
-      bx += s.ball.vx * age;
-      by += s.ball.vy * age;
-      if (by < V.R) by = 2 * V.R - by;                        // walls bounce predictably
-      else if (by > V.H - V.R) by = 2 * (V.H - V.R) - by;
-      // Contact is the server's call, so never run the ball past a paddle ahead of the verdict.
-      const fa = V.AX + V.PW + V.R, fb = V.BX - V.R;
-      if (s.ball.x >= fa && bx < fa) bx = fa;
-      if (s.ball.x <= fb && bx > fb) bx = fb;
-    }
-    ctx.beginPath();
-    ctx.arc(bx, by, V.R, 0, TAU);   // R is the server's collision radius, so this is the real shape
-    ctx.fill();
+    ballAt(s, now);
+    if (jitterPx >= 0) { if (tele.jit.length < CAP) tele.jit.push(jitterPx); }
+    else tele.clamped++;
+    if (ballAge > tele.ageMax) tele.ageMax = ballAge;
   }
 
-  if (s.score.a * 100 + s.score.b !== lastScore) {
-    lastScore = s.score.a * 100 + s.score.b; sScore = s.score.a + '  ' + s.score.b;
-  }
-  ctx.font = 'bold 44px ui-monospace, monospace'; ctx.textAlign = 'center';
-  ctx.fillText(sScore, V.W / 2, 52);
-  if (s.status === 'count') ctx.fillText(CD[Math.ceil(s.cd)] || '', V.W / 2, V.H / 2 + 16);
-
-  if (s.spectators !== lastSpec) { lastSpec = s.spectators; sSpec = 'spectators ' + s.spectators; }
-  ctx.font = '14px ui-monospace, monospace'; ctx.textAlign = 'left';
-  ctx.fillText(sSpec, 8, V.H - 10);
-  ctx.textAlign = 'right';
-  ctx.fillText(roleLabel, V.W - 8, V.H - 10);
+  if (glProg) drawGL(s, padA, padB);
+  else if (ctx) draw2D(s, padA, padB);
+  hud(s);
 }
 requestAnimationFrame(frame);
 </script>

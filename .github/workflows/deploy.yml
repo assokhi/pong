@@ -16,7 +16,15 @@ jobs:
           cache: npm
       - run: npm ci
       - run: node --check server.js
+      - name: Client parses
+        # the page is one inline <script>; nothing else in this job would ever notice it was broken
+        run: npm run check:client
       - run: npm test
+      - name: Client net math
+        run: npm run test:predict
+      - name: Degraded-network system test
+        # boots its own server and impairment proxy, so it needs nothing set up around it
+        run: npm run test:impaired
       - name: Smoke test against a local server
         # no env overrides: the smoke test asks POST /room for its own short timings, so this
         # runs exactly the same path as the live deployment

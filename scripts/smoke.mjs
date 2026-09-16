@@ -19,10 +19,17 @@ const post = async body => {
   return res.json();
 };
 
+// A predicate that throws is a predicate whose subject has not arrived yet — two sockets in one
+// process receive the same broadcast as independent events, so one can be a tick ahead of the
+// other. Retry on it and report it if the wait runs out; do not let it crash the run.
 async function until(fn, what, ms = 8000) {
   const end = Date.now() + ms;
-  while (Date.now() < end) { if (fn()) return; await sleep(50); }
-  assert.fail('timed out waiting for ' + what);
+  let last = null;
+  while (Date.now() < end) {
+    try { if (fn()) return; last = null; } catch (e) { last = e; }
+    await sleep(50);
+  }
+  assert.fail('timed out waiting for ' + what + (last ? ' — predicate kept throwing: ' + last.message : ''));
 }
 
 function open(id, role, token) {
@@ -62,6 +69,13 @@ assert(clamped.reserveMs === 500 && clamped.emptyMs === 1000, 'out-of-range timi
 const page = await fetch(base + '/r/' + id);
 assert(page.status === 200 && (await page.text()).includes('<canvas'), 'client html not served');
 
+// Keepalive fixture, opened here so its 35 s of idling overlaps the rest of the suite rather than
+// adding to it. Asserted at the very end.
+const idleRoom = await post({ emptyMs: 600e3 });
+const idleAt = Date.now();
+const idle = await open(idleRoom.id, 'watch');
+assert(idle.welcome, 'could not open the keepalive fixture');
+
 const a = await open(id, 'play'), b = await open(id, 'play');
 assert(a.welcome.role === 'a' && b.welcome.role === 'b', 'slot assignment: ' + a.welcome.role + '/' + b.welcome.role);
 
@@ -72,6 +86,24 @@ const spec = await open(id, 'watch');
 assert(spec.welcome.role === null, 'spectator was given a slot');
 await until(() => spec.last && spec.last.spectators === 1, 'spectator count');
 await until(() => ['count', 'play'].includes(a.last.status), 'game to start');
+
+// Beta telemetry: accepted, rate limited, and never trusted enough to reach a log unshaped.
+a.send(JSON.stringify({
+  type: 'telemetry', ms: 15000,
+  net: { rtt: 42, snaps: 370, gapMed: 40, gapP95: 95, gapMax: 'not a number', stalls: -3 },
+  render: { fps: 60, jitMed: 0.1, jitP95: 0.4, jitMax: 1e12 },
+  view: { w: 1920, h: 1080, dpr: 2 },
+  note: 'smoke test note', evil: { nested: 'must not survive' },
+}));
+a.send(JSON.stringify({ type: 'telemetry', ms: 1, note: 'should be rate limited' }));
+await sleep(300);
+assert(a.last.status !== undefined, 'server state corrupted by a telemetry frame');
+
+// /metrics holds players' free-text notes, so with no token configured it must not exist at all.
+const noTok = await fetch(base + '/metrics');
+const badTok = await fetch(base + '/metrics?token=wrong');
+assert(noTok.status === 404 && badTok.status === 404,
+  'GET /metrics answered without a valid token: ' + noTok.status + '/' + badTok.status);
 
 // a spectator has no input path; a player's input moves only their own paddle
 spec.send(JSON.stringify({ type: 'input', y: 60 }));
@@ -141,6 +173,22 @@ assert(late.welcome, 'a room was swept before anyone could connect to it');
 const rejoin = await open(kept.id, 'watch');
 assert(rejoin.welcome, 'a spectator-only room was swept before its no-player TTL');
 late.close(); rejoin.close(); keptSpec.close();
+
+// The server pings every beat and terminates any socket that misses a pong. Ping and pong are
+// protocol-level frames, so anything sitting between the app and the player has to forward them —
+// and a proxy that swallows them instead turns that keepalive into a machine that kills healthy
+// connections on a timer. Nothing local can tell us whether the real edge forwards them; only the
+// live run can, which is why this assertion exists here and not in a unit test.
+const held = 35e3 - (Date.now() - idleAt);
+if (held > 0) await sleep(held);
+assert(!idle.closed && !idle.bye,
+  'an idle connection was dropped within 35s: ' + JSON.stringify(idle.bye || idle.closed) +
+  ' — if this is a 1006 with no reason, a proxy is eating ping/pong frames');
+const before = idle.last && idle.last.t;
+assert(before, 'the idle connection never received a snapshot');
+await sleep(500);
+assert(idle.last.t > before, 'an idle connection went quiet without closing');
+idle.close();
 
 console.log('smoke ok against ' + base);
 process.exit(0);

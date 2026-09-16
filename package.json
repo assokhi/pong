@@ -4,7 +4,11 @@
   "scripts": {
     "start": "node server.js",
     "test": "node server.js --selftest",
-    "smoke": "node scripts/smoke.mjs"
+    "check:client": "node scripts/checkclient.mjs",
+    "test:predict": "node scripts/predict.test.mjs",
+    "test:impaired": "node scripts/impaired.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "netshape": "node scripts/netshape.mjs"
   },
   "dependencies": {
     "ws": "^8.18.0"
